@@ -1,13 +1,23 @@
 {
   "name": "opencode-rexd-target",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "REXD Target Plugin for OpenCode - transparent remote machine access",
   "main": "dist/index.js",
-  "types": "dist/index.d.ts",
+  "exports": {
+    ".": "./dist/index.js"
+  },
   "type": "module",
+  "files": [
+    "dist",
+    ".opencode/commands/target.md",
+    "README.md",
+    "LICENSE",
+    "scripts/install.sh"
+  ],
   "scripts": {
     "build": "bun build ./src/index.ts --outdir ./dist --target node",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "clean": "rm -rf dist"
   },
   "dependencies": {
     "@opencode-ai/plugin": "^1.0.0",

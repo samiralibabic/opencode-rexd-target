@@ -5,6 +5,7 @@ import {
   readFileSync,
   readdirSync,
   statSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs"
 import { spawn } from "node:child_process"
@@ -70,6 +71,37 @@ type Connection = {
   execExits: Map<string, any>
   execExitWaiters: Map<string, ExitWaiter>
   ptyBuffers: Map<string, string[]>
+}
+
+type PatchChunk = {
+  oldLines: string[]
+  newLines: string[]
+  changeContext?: string
+  isEndOfFile?: boolean
+}
+
+type PatchHunk =
+  | {
+      type: "add"
+      path: string
+      contents: string
+    }
+  | {
+      type: "delete"
+      path: string
+    }
+  | {
+      type: "update"
+      path: string
+      movePath?: string
+      chunks: PatchChunk[]
+    }
+
+type PatchSummary = {
+  added: string[]
+  updated: string[]
+  deleted: string[]
+  moved: Array<{ from: string; to: string }>
 }
 
 const targetsCache = new Map<string, TargetConfig>()
@@ -240,6 +272,394 @@ function formatListEntries(entries: Array<{ name: string; type: string }>): stri
   return entries
     .map((entry) => (entry.type === "dir" ? `${entry.name}/` : entry.name))
     .join("\n")
+}
+
+function applyExactEdit(
+  content: string,
+  oldString: string,
+  newString: string,
+  replaceAll = false,
+): { content: string; replacements: number } {
+  if (oldString === newString) {
+    throw new Error("oldString and newString are identical")
+  }
+
+  if (oldString === "") {
+    return { content: newString, replacements: 1 }
+  }
+
+  if (replaceAll) {
+    const replacements = content.split(oldString).length - 1
+    if (replacements <= 0) {
+      throw new Error("oldString not found")
+    }
+    return {
+      content: content.split(oldString).join(newString),
+      replacements,
+    }
+  }
+
+  const first = content.indexOf(oldString)
+  if (first === -1) {
+    throw new Error("oldString not found")
+  }
+  if (content.indexOf(oldString, first + oldString.length) !== -1) {
+    throw new Error("oldString matched multiple locations; set replaceAll=true")
+  }
+
+  return {
+    content: content.slice(0, first) + newString + content.slice(first + oldString.length),
+    replacements: 1,
+  }
+}
+
+function parsePatchEnvelope(patchText: string): PatchHunk[] {
+  const normalized = patchText.replace(/\r\n/g, "\n").replace(/\r/g, "\n")
+  const lines = normalized.split("\n")
+
+  const begin = lines.findIndex((line) => line.trim() === "*** Begin Patch")
+  if (begin === -1) {
+    throw new Error("Invalid patch format: missing *** Begin Patch")
+  }
+
+  let end = -1
+  for (let i = begin + 1; i < lines.length; i++) {
+    if (lines[i].trim() === "*** End Patch") {
+      end = i
+      break
+    }
+  }
+  if (end === -1 || end <= begin) {
+    throw new Error("Invalid patch format: missing *** End Patch")
+  }
+
+  const hunks: PatchHunk[] = []
+  let i = begin + 1
+  while (i < end) {
+    const line = lines[i]
+
+    if (line.startsWith("*** Add File:")) {
+      const filePath = line.slice("*** Add File:".length).trim()
+      if (!filePath) throw new Error(`Invalid add file header at line ${i + 1}`)
+      i += 1
+
+      const contentLines: string[] = []
+      while (i < end && !lines[i].startsWith("***")) {
+        if (lines[i].startsWith("+")) {
+          contentLines.push(lines[i].slice(1))
+        }
+        i += 1
+      }
+
+      hunks.push({ type: "add", path: filePath, contents: contentLines.join("\n") })
+      continue
+    }
+
+    if (line.startsWith("*** Delete File:")) {
+      const filePath = line.slice("*** Delete File:".length).trim()
+      if (!filePath) throw new Error(`Invalid delete file header at line ${i + 1}`)
+      hunks.push({ type: "delete", path: filePath })
+      i += 1
+      continue
+    }
+
+    if (line.startsWith("*** Update File:")) {
+      const filePath = line.slice("*** Update File:".length).trim()
+      if (!filePath) throw new Error(`Invalid update file header at line ${i + 1}`)
+      i += 1
+
+      let movePath: string | undefined
+      if (i < end && lines[i].startsWith("*** Move to:")) {
+        movePath = lines[i].slice("*** Move to:".length).trim()
+        if (!movePath) throw new Error(`Invalid move target at line ${i + 1}`)
+        i += 1
+      }
+
+      const chunks: PatchChunk[] = []
+      while (i < end && !lines[i].startsWith("***")) {
+        if (!lines[i].startsWith("@@")) {
+          i += 1
+          continue
+        }
+
+        const changeContext = lines[i].slice(2).trim()
+        i += 1
+        const oldLines: string[] = []
+        const newLines: string[] = []
+        let isEndOfFile = false
+
+        while (i < end && !lines[i].startsWith("@@") && !lines[i].startsWith("***")) {
+          const changeLine = lines[i]
+          if (changeLine === "*** End of File") {
+            isEndOfFile = true
+            i += 1
+            break
+          }
+          if (changeLine.length === 0) {
+            i += 1
+            continue
+          }
+
+          const prefix = changeLine[0]
+          const body = changeLine.slice(1)
+          if (prefix === " ") {
+            oldLines.push(body)
+            newLines.push(body)
+          } else if (prefix === "-") {
+            oldLines.push(body)
+          } else if (prefix === "+") {
+            newLines.push(body)
+          }
+          i += 1
+        }
+
+        chunks.push({ oldLines, newLines, changeContext, isEndOfFile })
+      }
+
+      hunks.push({ type: "update", path: filePath, movePath, chunks })
+      continue
+    }
+
+    i += 1
+  }
+
+  if (hunks.length === 0) {
+    throw new Error("Patch does not contain any hunks")
+  }
+  return hunks
+}
+
+function splitPatchLines(content: string): string[] {
+  const normalized = content.replace(/\r\n/g, "\n").replace(/\r/g, "\n")
+  const lines = normalized.split("\n")
+  if (lines.length > 0 && lines[lines.length - 1] === "") {
+    return lines.slice(0, -1)
+  }
+  return lines
+}
+
+function sequenceMatches(
+  lines: string[],
+  pattern: string[],
+  start: number,
+  compare: (left: string, right: string) => boolean,
+): boolean {
+  for (let i = 0; i < pattern.length; i++) {
+    if (!compare(lines[start + i], pattern[i])) return false
+  }
+  return true
+}
+
+function tryMatchSequence(
+  lines: string[],
+  pattern: string[],
+  start: number,
+  endOfFile: boolean,
+  compare: (left: string, right: string) => boolean,
+): number {
+  if (pattern.length === 0 || lines.length < pattern.length) return -1
+
+  if (endOfFile) {
+    const fromEnd = lines.length - pattern.length
+    if (fromEnd >= start && sequenceMatches(lines, pattern, fromEnd, compare)) {
+      return fromEnd
+    }
+  }
+
+  const maxStart = lines.length - pattern.length
+  for (let i = start; i <= maxStart; i++) {
+    if (sequenceMatches(lines, pattern, i, compare)) {
+      return i
+    }
+  }
+  return -1
+}
+
+function seekPatchSequence(lines: string[], pattern: string[], start: number, endOfFile: boolean): number {
+  if (pattern.length === 0) return -1
+
+  const exact = tryMatchSequence(lines, pattern, start, endOfFile, (left, right) => left === right)
+  if (exact !== -1) return exact
+
+  const rstrip = tryMatchSequence(lines, pattern, start, endOfFile, (left, right) => {
+    return left.replace(/[ \t]+$/, "") === right.replace(/[ \t]+$/, "")
+  })
+  if (rstrip !== -1) return rstrip
+
+  return tryMatchSequence(lines, pattern, start, endOfFile, (left, right) => {
+    return left.trim() === right.trim()
+  })
+}
+
+function derivePatchedContent(original: string, chunks: PatchChunk[]): string {
+  const originalLines = splitPatchLines(original)
+  const replacements: Array<{ start: number; oldLen: number; newLines: string[] }> = []
+  let searchStart = 0
+
+  for (const chunk of chunks) {
+    if (chunk.changeContext) {
+      const contextIndex = seekPatchSequence(originalLines, [chunk.changeContext], searchStart, false)
+      if (contextIndex === -1) {
+        throw new Error(`Failed to find patch context: ${chunk.changeContext}`)
+      }
+      searchStart = contextIndex + 1
+    }
+
+    if (chunk.oldLines.length === 0) {
+      replacements.push({ start: originalLines.length, oldLen: 0, newLines: chunk.newLines })
+      continue
+    }
+
+    let oldLines = [...chunk.oldLines]
+    let newLines = [...chunk.newLines]
+    let found = seekPatchSequence(originalLines, oldLines, searchStart, Boolean(chunk.isEndOfFile))
+
+    if (found === -1 && oldLines.length > 0 && oldLines[oldLines.length - 1] === "") {
+      oldLines = oldLines.slice(0, -1)
+      if (newLines.length > 0 && newLines[newLines.length - 1] === "") {
+        newLines = newLines.slice(0, -1)
+      }
+      found = seekPatchSequence(originalLines, oldLines, searchStart, Boolean(chunk.isEndOfFile))
+    }
+
+    if (found === -1) {
+      throw new Error("Failed to find expected patch lines")
+    }
+
+    replacements.push({ start: found, oldLen: oldLines.length, newLines })
+    searchStart = found + oldLines.length
+  }
+
+  let result = [...originalLines]
+  for (let i = replacements.length - 1; i >= 0; i--) {
+    const replacement = replacements[i]
+    result = [
+      ...result.slice(0, replacement.start),
+      ...replacement.newLines,
+      ...result.slice(replacement.start + replacement.oldLen),
+    ]
+  }
+
+  if (result.length === 0 || result[result.length - 1] !== "") {
+    result.push("")
+  }
+
+  return result.join("\n")
+}
+
+function applyLocalPatch(baseDir: string, patchText: string): PatchSummary {
+  const hunks = parsePatchEnvelope(patchText)
+  const summary: PatchSummary = { added: [], updated: [], deleted: [], moved: [] }
+
+  for (const hunk of hunks) {
+    const targetPath = localPath(baseDir, hunk.path)
+
+    if (hunk.type === "add") {
+      if (existsSync(targetPath)) {
+        throw new Error(`File already exists: ${targetPath}`)
+      }
+      const dir = dirname(targetPath)
+      if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
+      const content = hunk.contents !== "" && !hunk.contents.endsWith("\n") ? `${hunk.contents}\n` : hunk.contents
+      writeFileSync(targetPath, content)
+      summary.added.push(targetPath)
+      continue
+    }
+
+    if (hunk.type === "delete") {
+      if (!existsSync(targetPath)) {
+        throw new Error(`File does not exist: ${targetPath}`)
+      }
+      unlinkSync(targetPath)
+      summary.deleted.push(targetPath)
+      continue
+    }
+
+    if (!existsSync(targetPath)) {
+      throw new Error(`File does not exist: ${targetPath}`)
+    }
+
+    const current = readFileSync(targetPath, "utf-8")
+    const next = hunk.chunks.length > 0 ? derivePatchedContent(current, hunk.chunks) : current
+
+    if (hunk.movePath) {
+      const movePath = localPath(baseDir, hunk.movePath)
+      const moveDir = dirname(movePath)
+      if (!existsSync(moveDir)) mkdirSync(moveDir, { recursive: true })
+      writeFileSync(movePath, next)
+
+      if (movePath === targetPath) {
+        summary.updated.push(targetPath)
+      } else {
+        unlinkSync(targetPath)
+        summary.moved.push({ from: targetPath, to: movePath })
+      }
+      continue
+    }
+
+    writeFileSync(targetPath, next)
+    summary.updated.push(targetPath)
+  }
+
+  return summary
+}
+
+function normalizePatchSummary(value: any): PatchSummary {
+  const toArray = (input: unknown): string[] =>
+    Array.isArray(input) ? input.map((item) => String(item)) : []
+
+  const moved = Array.isArray(value?.moved)
+    ? value.moved
+        .map((item: any) => ({ from: String(item?.from ?? ""), to: String(item?.to ?? "") }))
+        .filter((item: { from: string; to: string }) => item.from && item.to)
+    : []
+
+  return {
+    added: toArray(value?.added),
+    updated: toArray(value?.updated),
+    deleted: toArray(value?.deleted),
+    moved,
+  }
+}
+
+function renderPatchSummary(summary: PatchSummary): string {
+  const lines: string[] = []
+  if (summary.added.length > 0) lines.push(`Added: ${summary.added.join(", ")}`)
+  if (summary.updated.length > 0) lines.push(`Updated: ${summary.updated.join(", ")}`)
+  if (summary.deleted.length > 0) lines.push(`Deleted: ${summary.deleted.join(", ")}`)
+  if (summary.moved.length > 0) {
+    lines.push(`Moved: ${summary.moved.map((item) => `${item.from} -> ${item.to}`).join(", ")}`)
+  }
+  if (lines.length === 0) return "Patch applied with no file changes"
+  return `Patch applied:\n${lines.join("\n")}`
+}
+
+function guardRemotePatch(
+  target: TargetConfig,
+  cwd: string,
+  workspaceRoots: string[],
+  patchText: string,
+): string | null {
+  let hunks: PatchHunk[]
+  try {
+    hunks = parsePatchEnvelope(patchText)
+  } catch (error) {
+    return `Invalid patch: ${error instanceof Error ? error.message : String(error)}`
+  }
+
+  for (const hunk of hunks) {
+    const targetPath = remotePath(cwd, hunk.path)
+    const targetGuard = guardRemotePath(target, targetPath, workspaceRoots)
+    if (targetGuard) return targetGuard
+
+    if (hunk.type === "update" && hunk.movePath) {
+      const movePath = remotePath(cwd, hunk.movePath)
+      const moveGuard = guardRemotePath(target, movePath, workspaceRoots)
+      if (moveGuard) return moveGuard
+    }
+  }
+
+  return null
 }
 
 function connectionKey(projectDir: string, alias: string): string {
@@ -448,13 +868,13 @@ async function createConnection(projectDir: string, alias: string, target: Targe
 
   const session = await rpcRequest(
     connection,
-    "session.open",
-    {
-      client_name: "opencode-rexd-target",
-      client_version: "0.3.0",
-      workspace_roots: target.workspaceRoots,
-    },
-    20000,
+      "session.open",
+      {
+        client_name: "opencode-rexd-target",
+        client_version: "0.2.0",
+        workspace_roots: target.workspaceRoots,
+      },
+      20000,
   )
 
   connection.sessionID = String(session?.session_id ?? "")
@@ -806,6 +1226,110 @@ export const RexdTargetPlugin: Plugin = async ({ directory }) => {
             atomic: true,
           })
           return `Wrote ${args.filePath}`
+        },
+      }),
+
+      edit: tool({
+        description: "Edit a file locally or on active REXD target",
+        args: {
+          filePath: tool.schema.string().describe("Path to file"),
+          oldString: tool.schema.string().describe("Exact text to replace"),
+          newString: tool.schema.string().describe("Replacement text"),
+          replaceAll: tool.schema.boolean().optional().describe("Replace all matches"),
+        },
+        async execute(args, context: ToolContext) {
+          const state = loadState(context.directory)
+          if (!state.activeTargetAlias) {
+            const path = localPath(context.directory, args.filePath)
+            const existed = existsSync(path)
+            const current = existed ? readFileSync(path, "utf-8") : ""
+
+            if (!existed && args.oldString !== "") {
+              throw new Error(`File does not exist: ${path}`)
+            }
+
+            const edited = applyExactEdit(current, args.oldString, args.newString, args.replaceAll ?? false)
+            const dir = dirname(path)
+            if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
+            writeFileSync(path, edited.content)
+            return `Edited ${args.filePath} (${edited.replacements} replacement${edited.replacements === 1 ? "" : "s"})`
+          }
+
+          const connection = await ensureConnection(context.directory)
+          const path = remotePath(connection.cwd, args.filePath)
+          const guardError = guardRemotePath(connection.target, path, connection.workspaceRoots)
+          if (guardError) return guardError
+
+          const response = await rpcRequest(connection, "fs.edit", {
+            session_id: connection.sessionID,
+            path,
+            old_string: args.oldString,
+            new_string: args.newString,
+            replace_all: args.replaceAll ?? false,
+          })
+
+          const replacements = Number(response?.replacements ?? 0)
+          return `Edited ${args.filePath} (${replacements} replacement${replacements === 1 ? "" : "s"})`
+        },
+      }),
+
+      apply_patch: tool({
+        description: "Apply a patch locally or on active REXD target",
+        args: {
+          patchText: tool.schema.string().describe("Patch text in apply_patch envelope format"),
+        },
+        async execute(args, context: ToolContext) {
+          const state = loadState(context.directory)
+          if (!state.activeTargetAlias) {
+            const summary = applyLocalPatch(context.directory, args.patchText)
+            return renderPatchSummary(summary)
+          }
+
+          const connection = await ensureConnection(context.directory)
+          const guardError = guardRemotePatch(
+            connection.target,
+            connection.cwd,
+            connection.workspaceRoots,
+            args.patchText,
+          )
+          if (guardError) return guardError
+
+          const response = await rpcRequest(connection, "fs.patch", {
+            session_id: connection.sessionID,
+            patch_text: args.patchText,
+            cwd: connection.cwd,
+          })
+          return renderPatchSummary(normalizePatchSummary(response))
+        },
+      }),
+
+      patch: tool({
+        description: "Apply a patch locally or on active REXD target",
+        args: {
+          patchText: tool.schema.string().describe("Patch text in apply_patch envelope format"),
+        },
+        async execute(args, context: ToolContext) {
+          const state = loadState(context.directory)
+          if (!state.activeTargetAlias) {
+            const summary = applyLocalPatch(context.directory, args.patchText)
+            return renderPatchSummary(summary)
+          }
+
+          const connection = await ensureConnection(context.directory)
+          const guardError = guardRemotePatch(
+            connection.target,
+            connection.cwd,
+            connection.workspaceRoots,
+            args.patchText,
+          )
+          if (guardError) return guardError
+
+          const response = await rpcRequest(connection, "fs.patch", {
+            session_id: connection.sessionID,
+            patch_text: args.patchText,
+            cwd: connection.cwd,
+          })
+          return renderPatchSummary(normalizePatchSummary(response))
         },
       }),
 
