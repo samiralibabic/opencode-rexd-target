@@ -1,8 +1,17 @@
 # opencode-rexd-target
 
-`opencode-rexd-target` is an OpenCode plugin that makes a selected REXD target feel like local development.
+`opencode-rexd-target` is an OpenCode plugin that makes selected remote machines feel like local development.
 
-Once a target is active, the plugin transparently routes shell and filesystem tools to the remote host over SSH stdio (`ssh ... rexd --stdio`).
+It routes tool calls to [REXD](https://github.com/samiralibabic/rexd), the Remote Execution Daemon, over SSH stdio (`ssh ... rexd --stdio`).
+
+## What is REXD?
+
+[REXD](https://github.com/samiralibabic/rexd) is a lightweight remote execution daemon that exposes process, filesystem, and PTY operations through a JSON-RPC API.
+
+This plugin acts as the OpenCode client layer for REXD targets:
+
+- On active target: tool calls are routed to remote `rexd`
+- Without active target: tools run locally (normal OpenCode behavior)
 
 ## Features
 
@@ -16,7 +25,7 @@ Once a target is active, the plugin transparently routes shell and filesystem to
 ## Requirements
 
 - OpenCode with plugin support
-- REXD installed on target hosts and reachable over SSH
+- [REXD](https://github.com/samiralibabic/rexd) installed on target hosts and reachable over SSH
 - Target registry at `~/.config/rexd/targets.json`
 - REXD version with `fs.edit` and `fs.patch` support (v0.1.3+)
 
@@ -31,7 +40,7 @@ curl -fsSL https://raw.githubusercontent.com/samiralibabic/opencode-rexd-target/
 Pinned version:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/samiralibabic/opencode-rexd-target/main/scripts/install.sh | OPENCODE_REXD_TARGET_VERSION=v0.2.0 bash
+curl -fsSL https://raw.githubusercontent.com/samiralibabic/opencode-rexd-target/main/scripts/install.sh | OPENCODE_REXD_TARGET_VERSION=v0.2.1 bash
 ```
 
 The installer places files in your OpenCode config directory:
@@ -41,7 +50,7 @@ The installer places files in your OpenCode config directory:
 
 ## Post-install setup (required)
 
-1. Ensure every target host runs `rexd` v0.1.3 or newer.
+1. Ensure every target host runs [REXD](https://github.com/samiralibabic/rexd) `v0.1.3` or newer.
 2. Create/update `~/.config/rexd/targets.json` on your local machine.
 3. Restart OpenCode so the plugin is reloaded.
 4. Run `/target list` and then `/target use <alias>`.
@@ -92,7 +101,7 @@ Update commands:
 curl -fsSL https://raw.githubusercontent.com/samiralibabic/rexd/main/scripts/install.sh | REXD_VERSION=v0.1.3 bash
 
 # 2) local plugin
-curl -fsSL https://raw.githubusercontent.com/samiralibabic/opencode-rexd-target/main/scripts/install.sh | OPENCODE_REXD_TARGET_VERSION=v0.2.0 bash
+curl -fsSL https://raw.githubusercontent.com/samiralibabic/opencode-rexd-target/main/scripts/install.sh | OPENCODE_REXD_TARGET_VERSION=v0.2.1 bash
 ```
 
 If you update the plugin before `rexd`, remote `edit`/`apply_patch` calls can fail with method-not-found errors on older servers.

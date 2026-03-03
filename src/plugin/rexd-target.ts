@@ -871,7 +871,7 @@ async function createConnection(projectDir: string, alias: string, target: Targe
       "session.open",
       {
         client_name: "opencode-rexd-target",
-        client_version: "0.2.0",
+        client_version: "0.2.1",
         workspace_roots: target.workspaceRoots,
       },
       20000,

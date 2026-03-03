@@ -5,6 +5,7 @@ REPO="${OPENCODE_REXD_TARGET_REPO:-samiralibabic/opencode-rexd-target}"
 VERSION="${OPENCODE_REXD_TARGET_VERSION:-}"
 CONFIG_DIR="${OPENCODE_CONFIG_DIR:-$HOME/.config/opencode}"
 TARGETS_PATH="${REXD_TARGETS_PATH:-$HOME/.config/rexd/targets.json}"
+REXD_REPO="${REXD_REPO:-samiralibabic/rexd}"
 ASSET="opencode-rexd-target.tar.gz"
 
 need_cmd() {
@@ -81,6 +82,7 @@ echo "Installed command: ${CONFIG_DIR}/commands/target.md"
 
 echo
 echo "Next steps:"
+echo "- REXD (Remote Execution Daemon): https://github.com/${REXD_REPO}"
 if [[ -f "${TARGETS_PATH}" ]]; then
   echo "- Target registry found: ${TARGETS_PATH}"
 else
@@ -102,6 +104,8 @@ else
 EOF
 fi
 echo "- Ensure target hosts run rexd v0.1.3 or newer."
+echo "  Install/update on target host:"
+echo "  curl -fsSL https://raw.githubusercontent.com/${REXD_REPO}/main/scripts/install.sh | REXD_VERSION=v0.1.3 bash"
 echo "- Restart OpenCode to load updates."
 echo "- In OpenCode, run: /target list"
 echo "- Then activate: /target use <alias>"
