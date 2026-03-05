@@ -85,6 +85,10 @@ In OpenCode:
 
 Active target state is persisted per project at `.opencode/rexd-state.json`.
 
+## In action
+
+![OpenCode with active REXD target routing tools to a remote machine](docs/images/opencode-rexd-target.png)
+
 ## Updating (existing users)
 
 Update in this order:
