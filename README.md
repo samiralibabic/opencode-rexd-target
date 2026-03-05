@@ -13,7 +13,8 @@ It routes tool calls to [REXD](https://github.com/samiralibabic/rexd), the Remot
 This plugin acts as the OpenCode client layer for REXD targets:
 
 - On active target: tool calls are routed to remote `rexd`
-- Without active target: tools run locally (normal OpenCode behavior)
+- Without active target: file/shell tools run locally (normal OpenCode behavior)
+- PTY tools are currently remote-only and require an active target
 
 ## Features
 
@@ -22,7 +23,7 @@ This plugin acts as the OpenCode client layer for REXD targets:
 - Local fallback when no target is active
 - Core remote filesystem and shell support: `bash`, `read`, `write`, `list`, `glob`, `grep`
 - Remote file parity with native REXD methods: `edit`, `apply_patch`/`patch`
-- PTY support via dedicated tools: `pty_spawn`, `pty_write`, `pty_read`, `pty_list`, `pty_kill`
+- PTY support via dedicated remote tools: `pty_spawn`, `pty_write`, `pty_read`, `pty_list`, `pty_kill`
 
 ## Requirements
 
