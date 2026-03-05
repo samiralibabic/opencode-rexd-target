@@ -4,6 +4,8 @@
 
 It routes tool calls to [REXD](https://github.com/samiralibabic/rexd), the Remote Execution Daemon, over SSH stdio (`ssh ... rexd --stdio`).
 
+![OpenCode with active REXD target routing tools to a remote machine](docs/images/opencode-rexd-target.png)
+
 ## What is REXD?
 
 [REXD](https://github.com/samiralibabic/rexd) is a lightweight remote execution daemon that exposes process, filesystem, and PTY operations through a JSON-RPC API.
@@ -84,10 +86,6 @@ In OpenCode:
 - `/target clear`
 
 Active target state is persisted per project at `.opencode/rexd-state.json`.
-
-## In action
-
-![OpenCode with active REXD target routing tools to a remote machine](docs/images/opencode-rexd-target.png)
 
 ## Updating (existing users)
 
