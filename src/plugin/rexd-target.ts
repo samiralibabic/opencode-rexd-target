@@ -10,7 +10,7 @@ import {
 } from "node:fs"
 import { spawn } from "node:child_process"
 import { homedir } from "node:os"
-import { dirname, isAbsolute, posix, resolve } from "node:path"
+import { dirname, isAbsolute, posix, relative, resolve } from "node:path"
 
 const TARGETS_PATH = resolve(homedir(), ".config/rexd/targets.json")
 const STATE_DIR = ".opencode"
@@ -104,8 +104,52 @@ type PatchSummary = {
   moved: Array<{ from: string; to: string }>
 }
 
+type PatchUiFile = {
+  filePath: string
+  relativePath: string
+  type: "add" | "update" | "delete" | "move"
+  diff: string
+  before: string
+  after: string
+  additions: number
+  deletions: number
+  movePath?: string
+}
+
+type StagedUiState = {
+  title?: string
+  output?: string
+  metadata?: Record<string, any>
+}
+
 const targetsCache = new Map<string, TargetConfig>()
 const connections = new Map<string, Connection>()
+const stagedUiState = new Map<string, StagedUiState>()
+
+function uiStateKey(toolID: string, sessionID: string, callID?: string): string {
+  return `${sessionID}:${callID ?? ""}:${toolID}`
+}
+
+function getCallID(context: ToolContext): string | undefined {
+  const callID = (context as any).callID
+  if (typeof callID === "string" && callID.length > 0) return callID
+  if (typeof callID === "number") return String(callID)
+  return undefined
+}
+
+function stageUiState(toolID: string, context: ToolContext, state: StagedUiState): void {
+  const callID = getCallID(context)
+  if (!callID) return
+  stagedUiState.set(uiStateKey(toolID, context.sessionID, callID), state)
+}
+
+function consumeUiState(toolID: string, sessionID: string, callID: string): StagedUiState | undefined {
+  const key = uiStateKey(toolID, sessionID, callID)
+  const state = stagedUiState.get(key)
+  if (!state) return undefined
+  stagedUiState.delete(key)
+  return state
+}
 
 function loadTargets(): Record<string, TargetConfig> {
   if (targetsCache.size > 0) return Object.fromEntries(targetsCache)
@@ -438,6 +482,61 @@ function splitPatchLines(content: string): string[] {
   return lines
 }
 
+function diffPathLabel(value: string): string {
+  return value.replace(/\\/g, "/")
+}
+
+function createUnifiedDiff(oldPath: string, newPath: string, before: string, after: string): string {
+  const oldLines = splitPatchLines(before)
+  const newLines = splitPatchLines(after)
+  const oldCount = oldLines.length
+  const newCount = newLines.length
+
+  const header = [`--- ${diffPathLabel(oldPath)}`, `+++ ${diffPathLabel(newPath)}`]
+
+  if (oldCount === 0 && newCount === 0) {
+    return `${header.join("\n")}\n`
+  }
+
+  const oldRange = oldCount === 0 ? "0,0" : `1,${oldCount}`
+  const newRange = newCount === 0 ? "0,0" : `1,${newCount}`
+  const body: string[] = [`@@ -${oldRange} +${newRange} @@`]
+
+  for (const line of oldLines) body.push(`-${line}`)
+  for (const line of newLines) body.push(`+${line}`)
+
+  return `${header.join("\n")}\n${body.join("\n")}\n`
+}
+
+function countDiffChanges(diff: string): { additions: number; deletions: number } {
+  let additions = 0
+  let deletions = 0
+  for (const line of diff.split("\n")) {
+    if (line.startsWith("+++") || line.startsWith("@@")) continue
+    if (line.startsWith("+")) additions += 1
+    if (line.startsWith("---")) continue
+    if (line.startsWith("-")) deletions += 1
+  }
+  return { additions, deletions }
+}
+
+function relativeUiPathFromWorktree(worktree: string, absolutePath: string, fallback: string): string {
+  const relPath = resolve(absolutePath).startsWith(resolve(worktree))
+    ? relative(worktree, absolutePath).replace(/\\/g, "/")
+    : fallback.replace(/\\/g, "/")
+  return relPath || fallback.replace(/\\/g, "/")
+}
+
+function relativeUiPathFromCwd(cwd: string, absolutePath: string, fallback: string): string {
+  const normalizedCwd = normalizeRemotePath(cwd)
+  const normalizedPath = normalizeRemotePath(absolutePath)
+  if (inRoot(normalizedPath, normalizedCwd)) {
+    const value = posix.relative(normalizedCwd, normalizedPath)
+    return value || "."
+  }
+  return fallback
+}
+
 function sequenceMatches(
   lines: string[],
   pattern: string[],
@@ -602,6 +701,166 @@ function applyLocalPatch(baseDir: string, patchText: string): PatchSummary {
   }
 
   return summary
+}
+
+function buildLocalPatchUiFiles(baseDir: string, patchText: string, worktree: string): PatchUiFile[] {
+  const hunks = parsePatchEnvelope(patchText)
+  const files: PatchUiFile[] = []
+
+  for (const hunk of hunks) {
+    const sourcePath = localPath(baseDir, hunk.path)
+
+    if (hunk.type === "add") {
+      const before = ""
+      const after = hunk.contents !== "" && !hunk.contents.endsWith("\n") ? `${hunk.contents}\n` : hunk.contents
+      const diff = createUnifiedDiff(`/dev/null`, sourcePath, before, after)
+      const { additions, deletions } = countDiffChanges(diff)
+
+      files.push({
+        filePath: sourcePath,
+        relativePath: relativeUiPathFromWorktree(worktree, sourcePath, hunk.path),
+        type: "add",
+        diff,
+        before,
+        after,
+        additions,
+        deletions,
+      })
+      continue
+    }
+
+    if (hunk.type === "delete") {
+      const before = readFileSync(sourcePath, "utf-8")
+      const after = ""
+      const diff = createUnifiedDiff(sourcePath, `/dev/null`, before, after)
+      const { additions, deletions } = countDiffChanges(diff)
+
+      files.push({
+        filePath: sourcePath,
+        relativePath: relativeUiPathFromWorktree(worktree, sourcePath, hunk.path),
+        type: "delete",
+        diff,
+        before,
+        after,
+        additions,
+        deletions,
+      })
+      continue
+    }
+
+    const before = readFileSync(sourcePath, "utf-8")
+    const after = hunk.chunks.length > 0 ? derivePatchedContent(before, hunk.chunks) : before
+    const destinationPath = hunk.movePath ? localPath(baseDir, hunk.movePath) : sourcePath
+    const diff = createUnifiedDiff(sourcePath, destinationPath, before, after)
+    const { additions, deletions } = countDiffChanges(diff)
+
+    files.push({
+      filePath: sourcePath,
+      relativePath: relativeUiPathFromWorktree(worktree, destinationPath, hunk.movePath ?? hunk.path),
+      type: hunk.movePath ? "move" : "update",
+      diff,
+      before,
+      after,
+      additions,
+      deletions,
+      movePath: hunk.movePath ? destinationPath : undefined,
+    })
+  }
+
+  return files
+}
+
+async function readRemoteFile(connection: Connection, path: string): Promise<string> {
+  const response = await rpcRequest(connection, "fs.read", {
+    session_id: connection.sessionID,
+    path,
+  })
+  const encoding = String(response?.encoding ?? "utf8")
+  const raw = String(response?.content ?? "")
+  return decodeData(raw, encoding)
+}
+
+async function buildRemotePatchUiFiles(connection: Connection, patchText: string): Promise<PatchUiFile[]> {
+  const hunks = parsePatchEnvelope(patchText)
+  const files: PatchUiFile[] = []
+
+  for (const hunk of hunks) {
+    const sourcePath = remotePath(connection.cwd, hunk.path)
+
+    if (hunk.type === "add") {
+      const before = ""
+      const after = hunk.contents !== "" && !hunk.contents.endsWith("\n") ? `${hunk.contents}\n` : hunk.contents
+      const diff = createUnifiedDiff(`/dev/null`, sourcePath, before, after)
+      const { additions, deletions } = countDiffChanges(diff)
+
+      files.push({
+        filePath: sourcePath,
+        relativePath: relativeUiPathFromCwd(connection.cwd, sourcePath, hunk.path),
+        type: "add",
+        diff,
+        before,
+        after,
+        additions,
+        deletions,
+      })
+      continue
+    }
+
+    if (hunk.type === "delete") {
+      const before = await readRemoteFile(connection, sourcePath)
+      const after = ""
+      const diff = createUnifiedDiff(sourcePath, `/dev/null`, before, after)
+      const { additions, deletions } = countDiffChanges(diff)
+
+      files.push({
+        filePath: sourcePath,
+        relativePath: relativeUiPathFromCwd(connection.cwd, sourcePath, hunk.path),
+        type: "delete",
+        diff,
+        before,
+        after,
+        additions,
+        deletions,
+      })
+      continue
+    }
+
+    const before = await readRemoteFile(connection, sourcePath)
+    const after = hunk.chunks.length > 0 ? derivePatchedContent(before, hunk.chunks) : before
+    const destinationPath = hunk.movePath ? remotePath(connection.cwd, hunk.movePath) : sourcePath
+    const diff = createUnifiedDiff(sourcePath, destinationPath, before, after)
+    const { additions, deletions } = countDiffChanges(diff)
+
+    files.push({
+      filePath: sourcePath,
+      relativePath: relativeUiPathFromCwd(connection.cwd, destinationPath, hunk.movePath ?? hunk.path),
+      type: hunk.movePath ? "move" : "update",
+      diff,
+      before,
+      after,
+      additions,
+      deletions,
+      movePath: hunk.movePath ? destinationPath : undefined,
+    })
+  }
+
+  return files
+}
+
+function buildEditUiMetadata(filePath: string, before: string, after: string) {
+  const diff = createUnifiedDiff(filePath, filePath, before, after)
+  const { additions, deletions } = countDiffChanges(diff)
+  return {
+    diff,
+    filediff: {
+      file: filePath,
+      before,
+      after,
+      additions,
+      deletions,
+    },
+    diagnostics: {},
+  }
 }
 
 function normalizePatchSummary(value: any): PatchSummary {
@@ -1124,6 +1383,15 @@ export const RexdTargetPlugin: Plugin = async ({ directory }) => {
       setCommandText(output, message)
     },
 
+    "tool.execute.after": async (input, output) => {
+      const staged = consumeUiState(input.tool, input.sessionID, input.callID)
+      if (!staged) return
+
+      if (staged.title) output.title = staged.title
+      if (staged.output) output.output = staged.output
+      output.metadata = { ...(output.metadata ?? {}), ...(staged.metadata ?? {}) }
+    },
+
     tool: {
       target: tool({
         description: "Manage REXD targets: list/use/status/clear",
@@ -1252,6 +1520,10 @@ export const RexdTargetPlugin: Plugin = async ({ directory }) => {
             const dir = dirname(path)
             if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
             writeFileSync(path, edited.content)
+            stageUiState("edit", context, {
+              title: relativeUiPathFromWorktree(context.worktree, path, args.filePath),
+              metadata: buildEditUiMetadata(path, current, edited.content),
+            })
             return `Edited ${args.filePath} (${edited.replacements} replacement${edited.replacements === 1 ? "" : "s"})`
           }
 
@@ -1260,6 +1532,18 @@ export const RexdTargetPlugin: Plugin = async ({ directory }) => {
           const guardError = guardRemotePath(connection.target, path, connection.workspaceRoots)
           if (guardError) return guardError
 
+          let editMetadata: ReturnType<typeof buildEditUiMetadata> | undefined
+          try {
+            let current = ""
+            try {
+              current = await readRemoteFile(connection, path)
+            } catch {
+              current = ""
+            }
+            const edited = applyExactEdit(current, args.oldString, args.newString, args.replaceAll ?? false)
+            editMetadata = buildEditUiMetadata(path, current, edited.content)
+          } catch {}
+
           const response = await rpcRequest(connection, "fs.edit", {
             session_id: connection.sessionID,
             path,
@@ -1267,6 +1551,13 @@ export const RexdTargetPlugin: Plugin = async ({ directory }) => {
             new_string: args.newString,
             replace_all: args.replaceAll ?? false,
           })
+
+          if (editMetadata) {
+            stageUiState("edit", context, {
+              title: relativeUiPathFromCwd(connection.cwd, path, args.filePath),
+              metadata: editMetadata,
+            })
+          }
 
           const replacements = Number(response?.replacements ?? 0)
           return `Edited ${args.filePath} (${replacements} replacement${replacements === 1 ? "" : "s"})`
@@ -1281,7 +1572,20 @@ export const RexdTargetPlugin: Plugin = async ({ directory }) => {
         async execute(args, context: ToolContext) {
           const state = loadState(context.directory)
           if (!state.activeTargetAlias) {
+            let files: PatchUiFile[] | undefined
+            try {
+              files = buildLocalPatchUiFiles(context.directory, args.patchText, context.worktree)
+            } catch {}
+
             const summary = applyLocalPatch(context.directory, args.patchText)
+            if (files) {
+              stageUiState("apply_patch", context, {
+                metadata: {
+                  files,
+                  diff: files.map((file) => file.diff).join("\n"),
+                },
+              })
+            }
             return renderPatchSummary(summary)
           }
 
@@ -1294,41 +1598,25 @@ export const RexdTargetPlugin: Plugin = async ({ directory }) => {
           )
           if (guardError) return guardError
 
+          let files: PatchUiFile[] | undefined
+          try {
+            files = await buildRemotePatchUiFiles(connection, args.patchText)
+          } catch {}
+
           const response = await rpcRequest(connection, "fs.patch", {
             session_id: connection.sessionID,
             patch_text: args.patchText,
             cwd: connection.cwd,
           })
-          return renderPatchSummary(normalizePatchSummary(response))
-        },
-      }),
 
-      patch: tool({
-        description: "Apply a patch locally or on active REXD target",
-        args: {
-          patchText: tool.schema.string().describe("Patch text in apply_patch envelope format"),
-        },
-        async execute(args, context: ToolContext) {
-          const state = loadState(context.directory)
-          if (!state.activeTargetAlias) {
-            const summary = applyLocalPatch(context.directory, args.patchText)
-            return renderPatchSummary(summary)
+          if (files) {
+            stageUiState("apply_patch", context, {
+              metadata: {
+                files,
+                diff: files.map((file) => file.diff).join("\n"),
+              },
+            })
           }
-
-          const connection = await ensureConnection(context.directory)
-          const guardError = guardRemotePatch(
-            connection.target,
-            connection.cwd,
-            connection.workspaceRoots,
-            args.patchText,
-          )
-          if (guardError) return guardError
-
-          const response = await rpcRequest(connection, "fs.patch", {
-            session_id: connection.sessionID,
-            patch_text: args.patchText,
-            cwd: connection.cwd,
-          })
           return renderPatchSummary(normalizePatchSummary(response))
         },
       }),
