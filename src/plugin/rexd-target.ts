@@ -11,6 +11,7 @@ import {
 import { spawn } from "node:child_process"
 import { homedir } from "node:os"
 import { dirname, isAbsolute, posix, relative, resolve } from "node:path"
+import { createTwoFilesPatch } from "diff"
 
 const TARGETS_PATH = resolve(homedir(), ".config/rexd/targets.json")
 const STATE_DIR = ".opencode"
@@ -487,25 +488,33 @@ function diffPathLabel(value: string): string {
 }
 
 function createUnifiedDiff(oldPath: string, newPath: string, before: string, after: string): string {
-  const oldLines = splitPatchLines(before)
-  const newLines = splitPatchLines(after)
-  const oldCount = oldLines.length
-  const newCount = newLines.length
+  const patch = createTwoFilesPatch(
+    diffPathLabel(oldPath),
+    diffPathLabel(newPath),
+    before,
+    after,
+    "",
+    "",
+    { context: 3 },
+  )
 
-  const header = [`--- ${diffPathLabel(oldPath)}`, `+++ ${diffPathLabel(newPath)}`]
-
-  if (oldCount === 0 && newCount === 0) {
-    return `${header.join("\n")}\n`
+  const lines = patch.split("\n")
+  if (lines[0]?.startsWith("===================================================================")) {
+    return lines.slice(1).join("\n")
   }
+  return patch
+}
 
-  const oldRange = oldCount === 0 ? "0,0" : `1,${oldCount}`
-  const newRange = newCount === 0 ? "0,0" : `1,${newCount}`
-  const body: string[] = [`@@ -${oldRange} +${newRange} @@`]
+function detectEol(content: string): "\r\n" | "\n" | "\r" {
+  const lf = content.indexOf("\n")
+  if (lf !== -1) {
+    return lf > 0 && content[lf - 1] === "\r" ? "\r\n" : "\n"
+  }
+  return content.includes("\r") ? "\r" : "\n"
+}
 
-  for (const line of oldLines) body.push(`-${line}`)
-  for (const line of newLines) body.push(`+${line}`)
-
-  return `${header.join("\n")}\n${body.join("\n")}\n`
+function hasTrailingNewline(content: string): boolean {
+  return /\r\n$|\n$|\r$/.test(content)
 }
 
 function countDiffChanges(diff: string): { additions: number; deletions: number } {
@@ -592,6 +601,8 @@ function seekPatchSequence(lines: string[], pattern: string[], start: number, en
 
 function derivePatchedContent(original: string, chunks: PatchChunk[]): string {
   const originalLines = splitPatchLines(original)
+  const originalEol = detectEol(original)
+  const originalHadTrailingNewline = hasTrailingNewline(original)
   const replacements: Array<{ start: number; oldLen: number; newLines: string[] }> = []
   let searchStart = 0
 
@@ -639,11 +650,13 @@ function derivePatchedContent(original: string, chunks: PatchChunk[]): string {
     ]
   }
 
-  if (result.length === 0 || result[result.length - 1] !== "") {
-    result.push("")
+  if (originalHadTrailingNewline) {
+    if (result.length === 0 || result[result.length - 1] !== "") {
+      result.push("")
+    }
   }
 
-  return result.join("\n")
+  return result.join(originalEol)
 }
 
 function applyLocalPatch(baseDir: string, patchText: string): PatchSummary {
