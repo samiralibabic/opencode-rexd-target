@@ -1143,7 +1143,7 @@ async function createConnection(projectDir: string, alias: string, target: Targe
       "session.open",
       {
         client_name: "opencode-rexd-target",
-        client_version: "0.2.1",
+        client_version: "0.2.4",
         workspace_roots: target.workspaceRoots,
       },
       20000,
@@ -1188,6 +1188,12 @@ async function ensureConnection(projectDir: string): Promise<Connection> {
   }
 
   return await createConnection(projectDir, state.activeTargetAlias, target)
+}
+
+function getPtyNoRemoteTargetMessage(projectDir: string): string | null {
+  const state = loadState(projectDir)
+  if (state.activeTargetAlias) return null
+  return "No remote target selected. PTY is remote-only. Commands run locally. Use /target use <alias> for a remote target."
 }
 
 function disconnectAlias(projectDir: string, alias: string): void {
@@ -1354,7 +1360,7 @@ async function handleTargetSubcommand(projectDir: string, subcommand: string, al
     case "status": {
       const state = loadState(projectDir)
       if (!state.activeTargetAlias) {
-        return "No active target. Use /target use <alias> to select a target."
+        return "No remote target selected. Commands run locally. Use /target use <alias> for a remote target."
       }
 
       const target = getTarget(state.activeTargetAlias)
@@ -1422,14 +1428,14 @@ export const RexdTargetPlugin: Plugin = async ({ directory }) => {
         args: {
           command: tool.schema.string().describe("Shell command"),
           description: tool.schema.string().optional().describe("Command description"),
-          timeout: tool.schema.number().optional().describe("Timeout in milliseconds"),
+          timeout_ms: tool.schema.number().optional().describe("Timeout in milliseconds"),
           workdir: tool.schema.string().optional().describe("Working directory"),
         },
         async execute(args, context: ToolContext) {
           const state = loadState(context.directory)
           if (!state.activeTargetAlias) {
             const cwd = args.workdir ? localPath(context.directory, args.workdir) : context.directory
-            const result = await runLocalExec(args.command, { cwd, timeoutMs: args.timeout })
+            const result = await runLocalExec(args.command, { cwd, timeoutMs: args.timeout_ms })
             return renderExecResult(result.stdout, result.stderr, result.exitCode)
           }
 
@@ -1440,7 +1446,7 @@ export const RexdTargetPlugin: Plugin = async ({ directory }) => {
 
           const result = await runRemoteExec(connection, args.command, {
             cwd: remoteCwd,
-            timeoutMs: args.timeout,
+            timeoutMs: args.timeout_ms,
           })
           return renderExecResult(result.stdout, result.stderr, result.exitCode)
         },
@@ -1754,6 +1760,9 @@ export const RexdTargetPlugin: Plugin = async ({ directory }) => {
           rows: tool.schema.number().optional().describe("Terminal rows"),
         },
         async execute(args, context: ToolContext) {
+          const noRemoteMessage = getPtyNoRemoteTargetMessage(context.directory)
+          if (noRemoteMessage) return noRemoteMessage
+
           const connection = await ensureConnection(context.directory)
           if (connection.target.capabilities?.pty === false) {
             return `Target \"${connection.alias}\" does not support PTY.`
@@ -1782,6 +1791,9 @@ export const RexdTargetPlugin: Plugin = async ({ directory }) => {
           data: tool.schema.string().describe("Input data"),
         },
         async execute(args, context: ToolContext) {
+          const noRemoteMessage = getPtyNoRemoteTargetMessage(context.directory)
+          if (noRemoteMessage) return noRemoteMessage
+
           const connection = await ensureConnection(context.directory)
           await rpcRequest(connection, "pty.input", {
             session_id: connection.sessionID,
@@ -1799,6 +1811,9 @@ export const RexdTargetPlugin: Plugin = async ({ directory }) => {
           limit: tool.schema.number().optional().describe("Number of chunks to read"),
         },
         async execute(args, context: ToolContext) {
+          const noRemoteMessage = getPtyNoRemoteTargetMessage(context.directory)
+          if (noRemoteMessage) return noRemoteMessage
+
           const connection = await ensureConnection(context.directory)
           const chunks = connection.ptyBuffers.get(args.id) ?? []
           if (!args.limit || args.limit <= 0) return chunks.join("")
@@ -1810,6 +1825,9 @@ export const RexdTargetPlugin: Plugin = async ({ directory }) => {
         description: "List known PTY sessions",
         args: {},
         async execute(_, context: ToolContext) {
+          const noRemoteMessage = getPtyNoRemoteTargetMessage(context.directory)
+          if (noRemoteMessage) return noRemoteMessage
+
           const connection = await ensureConnection(context.directory)
           const ids = [...connection.ptyBuffers.keys()]
           return ids.length > 0 ? ids.join("\n") : "No active PTY sessions"
@@ -1822,6 +1840,9 @@ export const RexdTargetPlugin: Plugin = async ({ directory }) => {
           id: tool.schema.string().describe("PTY id"),
         },
         async execute(args, context: ToolContext) {
+          const noRemoteMessage = getPtyNoRemoteTargetMessage(context.directory)
+          if (noRemoteMessage) return noRemoteMessage
+
           const connection = await ensureConnection(context.directory)
           await rpcRequest(connection, "pty.close", {
             session_id: connection.sessionID,
