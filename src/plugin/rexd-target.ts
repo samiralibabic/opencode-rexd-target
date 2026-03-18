@@ -1143,7 +1143,7 @@ async function createConnection(projectDir: string, alias: string, target: Targe
       "session.open",
       {
         client_name: "opencode-rexd-target",
-        client_version: "0.2.4",
+        client_version: "0.2.5",
         workspace_roots: target.workspaceRoots,
       },
       20000,
@@ -1404,11 +1404,20 @@ export const RexdTargetPlugin: Plugin = async ({ directory }) => {
 
     "tool.execute.after": async (input, output) => {
       const staged = consumeUiState(input.tool, input.sessionID, input.callID)
-      if (!staged) return
+      if (staged) {
+        if (staged.title) output.title = staged.title
+        if (staged.output) output.output = staged.output
+        output.metadata = { ...(output.metadata ?? {}), ...(staged.metadata ?? {}) }
+      }
 
-      if (staged.title) output.title = staged.title
-      if (staged.output) output.output = staged.output
-      output.metadata = { ...(output.metadata ?? {}), ...(staged.metadata ?? {}) }
+      if (input.tool === "bash" && typeof output.output === "string") {
+        const metadata = (output.metadata ?? {}) as Record<string, any>
+        output.metadata = {
+          ...metadata,
+          output: output.output,
+          description: typeof metadata.description === "string" ? metadata.description : "Shell",
+        }
+      }
     },
 
     tool: {
