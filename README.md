@@ -111,6 +111,15 @@ If you update the plugin before `rexd`, remote `edit`/`apply_patch` calls can fa
 
 Note: this plugin now preserves OpenCode UI metadata for `edit` and `apply_patch` so TUI diff rendering works the same way as native tools.
 
+As of `v0.2.5`, plugin `bash` results also mirror output into `metadata.output` so OpenCode's Bash tool panel reliably shows command body output.
+
+## Troubleshooting
+
+- Bash tool shows header but no body output:
+  - Update to `v0.2.5` or newer.
+  - Restart OpenCode after installing.
+  - If needed, clear/reselect target with `/target clear` then `/target use <alias>`.
+
 ## Development
 
 ```bash
