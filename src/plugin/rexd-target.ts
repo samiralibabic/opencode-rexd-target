@@ -20,6 +20,7 @@ const STATE_FILE = "rexd-state.json"
 type TargetConfig = {
   transport: "ssh" | "http" | "ws"
   description?: string
+  loginShell?: boolean
   defaultCwd?: string
   workspaceRoots?: string[]
   rootPolicy?: { mode: "strict" | "allow_within_server_roots" | "ask_on_escape"; extraRoots?: string[] }
@@ -1270,6 +1271,7 @@ async function runRemoteExec(
   command: string,
   options: { cwd?: string; timeoutMs?: number },
 ): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+  const login = connection.target.loginShell === true
   const start = await rpcRequest(
     connection,
     "exec.start",
@@ -1277,6 +1279,7 @@ async function runRemoteExec(
       session_id: connection.sessionID,
       command,
       shell: true,
+      ...(login ? { login: true } : {}),
       cwd: options.cwd ?? connection.cwd,
       timeout_ms: options.timeoutMs,
     },

@@ -70,12 +70,18 @@ Example `~/.config/rexd/targets.json`:
       "transport": "ssh",
       "host": "example.com",
       "user": "deploy",
+      "loginShell": false,
       "workspaceRoots": ["/srv/app"],
       "defaultCwd": "/srv/app"
     }
   }
 }
 ```
+
+`loginShell` is optional and defaults to `false`.
+
+- `false` (default): predictable non-login shell execution for automation.
+- `true`: compatibility mode for legacy targets that require login-shell startup files.
 
 ## Usage
 
