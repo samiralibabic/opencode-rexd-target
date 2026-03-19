@@ -30,7 +30,7 @@ This plugin acts as the OpenCode client layer for REXD targets:
 - OpenCode with plugin support
 - [REXD](https://github.com/samiralibabic/rexd) installed on target hosts and reachable over SSH
 - Target registry at `~/.config/rexd/targets.json`
-- REXD version with `fs.edit` and `fs.patch` support (v0.1.3+)
+- REXD version with `fs.edit` and `fs.patch` support (v0.1.3+). For `loginShell` compatibility mode, use v0.1.4+.
 
 ## Install
 
@@ -43,7 +43,7 @@ curl -fsSL https://raw.githubusercontent.com/samiralibabic/opencode-rexd-target/
 Pinned version:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/samiralibabic/opencode-rexd-target/main/scripts/install.sh | OPENCODE_REXD_TARGET_VERSION=v0.2.6 bash
+curl -fsSL https://raw.githubusercontent.com/samiralibabic/opencode-rexd-target/main/scripts/install.sh | OPENCODE_REXD_TARGET_VERSION=v0.2.7 bash
 ```
 
 The installer places files in your OpenCode config directory:
@@ -53,7 +53,7 @@ The installer places files in your OpenCode config directory:
 
 ## Post-install setup (required)
 
-1. Ensure every target host runs [REXD](https://github.com/samiralibabic/rexd) `v0.1.3` or newer.
+1. Ensure every target host runs [REXD](https://github.com/samiralibabic/rexd) `v0.1.4` or newer.
 2. Create/update `~/.config/rexd/targets.json` on your local machine.
 3. Restart OpenCode so the plugin is reloaded.
 4. Run `/target list` and then `/target use <alias>`.
@@ -107,10 +107,10 @@ Update commands:
 
 ```bash
 # 1) remote hosts
-curl -fsSL https://raw.githubusercontent.com/samiralibabic/rexd/main/scripts/install.sh | REXD_VERSION=v0.1.3 bash
+curl -fsSL https://raw.githubusercontent.com/samiralibabic/rexd/main/scripts/install.sh | REXD_VERSION=v0.1.4 bash
 
 # 2) local plugin
-curl -fsSL https://raw.githubusercontent.com/samiralibabic/opencode-rexd-target/main/scripts/install.sh | OPENCODE_REXD_TARGET_VERSION=v0.2.6 bash
+curl -fsSL https://raw.githubusercontent.com/samiralibabic/opencode-rexd-target/main/scripts/install.sh | OPENCODE_REXD_TARGET_VERSION=v0.2.7 bash
 ```
 
 If you update the plugin before `rexd`, remote `edit`/`apply_patch` calls can fail with method-not-found errors on older servers.

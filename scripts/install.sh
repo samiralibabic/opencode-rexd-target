@@ -103,9 +103,9 @@ else
   }
 EOF
 fi
-echo "- Ensure target hosts run rexd v0.1.3 or newer."
+echo "- Ensure target hosts run rexd v0.1.4 or newer."
 echo "  Install/update on target host:"
-echo "  curl -fsSL https://raw.githubusercontent.com/${REXD_REPO}/main/scripts/install.sh | REXD_VERSION=v0.1.3 bash"
+echo "  curl -fsSL https://raw.githubusercontent.com/${REXD_REPO}/main/scripts/install.sh | REXD_VERSION=v0.1.4 bash"
 echo "- Restart OpenCode to load updates."
 echo "- In OpenCode, run: /target list"
 echo "- Then activate: /target use <alias>"
