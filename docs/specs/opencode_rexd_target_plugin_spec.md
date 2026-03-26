@@ -1,4 +1,4 @@
-# OpenCode × REXD Target Plugin MVP Spec (Revised)
+# OpenCode × REXD Target Plugin Spec
 
 ## Goal
 
@@ -23,11 +23,11 @@ That means no “local vs remote tool” decision is pushed onto the model.
    - Instead, override OpenCode built-in tools by name (`bash`, `read`, `write`, etc.) and route based on active target.
    - When no target is active, wrappers can either pass through to local behavior (later) or behave as normal local built-ins by not being enabled.
 
-2. **SSH stdio is MVP transport**
+2. **SSH stdio is the primary transport**
    - Primary transport is `ssh <host> /usr/local/bin/rexd --stdio`.
    - HTTP/WS remain supported, but are not the first/default path for your workflow.
 
-3. **PTY support is part of MVP scope**
+3. **PTY support is part of the core scope**
    - OpenCode’s built-in `bash` behavior is synchronous/non-interactive, so PTY must be exposed via dedicated tools (similar UX to existing PTY plugins).
    - REXD already has PTY methods, so the adapter should expose them.
 
@@ -56,9 +56,9 @@ This avoids:
 
 ---
 
-## MVP Scope (Revised)
+## Current Scope
 
-### In scope (MVP)
+### In scope
 
 ### A) `/target` command UX
 - `/target list`
@@ -67,7 +67,7 @@ This avoids:
 - `/target clear`
 
 ### B) Persistent target state
-- Active target per project (preferred)
+- Active target per chat session (preferred)
 - Optional global default target
 
 ### C) Transparent built-in tool routing (remote parity)
@@ -101,7 +101,7 @@ Expose dedicated PTY tools backed by REXD PTY methods:
 
 ---
 
-## Out of scope (MVP)
+## Out of scope
 
 - Multi-target orchestration in a single prompt
 - Secret management UI
@@ -133,7 +133,7 @@ Expose dedicated PTY tools backed by REXD PTY methods:
 Responsibilities:
 - `/target` command interception + handling
 - target registry loading
-- state persistence (project/global)
+- state persistence (session/global)
 - prompt injection (active target context)
 - SSH stdio client management (or delegates to transport module)
 - optional permission/guardrail prompts for remote-root escapes
@@ -165,16 +165,16 @@ Global plugin + tools:
 - `~/.config/opencode/tools/list.ts`
 - `~/.config/opencode/tools/glob.ts`
 - `~/.config/opencode/tools/grep.ts`
-- `~/.config/opencode/tools/edit.ts` (if included in MVP cut)
-- `~/.config/opencode/tools/patch.ts` (if included in MVP cut)
+- `~/.config/opencode/tools/edit.ts` (if included in the current cut)
+- `~/.config/opencode/tools/patch.ts` (if included in the current cut)
 - `~/.config/opencode/tools/pty-*.ts` (PTY tools)
 
 REXD config/state:
 - `~/.config/rexd/targets.json`
 - `~/.config/rexd/opencode-state.json` (optional global default)
 
-Project state:
-- `.opencode/rexd-state.json`
+Session state:
+- `~/.config/opencode/rexd-target/sessions/<sha256(sessionID)>.json`
 
 ---
 
@@ -200,7 +200,7 @@ Each target:
   - `fs`: boolean
   - `pty`: boolean
 
-### SSH target fields (MVP-default)
+### SSH target fields (primary/default)
 - `host`: string
 - `user`: string (optional)
 - `port`: number (optional)
@@ -225,8 +225,8 @@ Notes:
 
 State must live outside model context and be managed by plugin/tool code.
 
-### Project state (preferred)
-`.opencode/rexd-state.json`
+### Session state (preferred)
+`~/.config/opencode/rexd-target/sessions/<sha256(sessionID)>.json`
 
 Fields:
 - `activeTargetAlias`: string | null
@@ -256,7 +256,7 @@ Create a standard custom command so `/target` appears in OpenCode.
 Command content should be a marker payload the plugin can recognize, e.g.:
 - `__REXD_TARGET__ $ARGUMENTS`
 
-Supported subcommands (MVP):
+Supported subcommands:
 - `/target list`
 - `/target use <alias>`
 - `/target status`
@@ -343,7 +343,7 @@ Override OpenCode built-ins by **the same tool names** so the agent does not cho
 - Route to REXD `fs.*`
 
 ### `grep`
-MVP options:
+Options:
 1. **Fastest path:** route to remote `bash` using `rg`/`grep`
 2. **Cleaner protocol path:** add `fs.grep` to REXD later
 
@@ -351,9 +351,9 @@ Start with option 1 if you want speed.
 
 ### `edit` / `patch`
 
-For this implementation track, use **native REXD methods** (Option B) and make them part of the MVP path.
+For this implementation track, use **native REXD methods** (Option B) and make them part of the default implementation path.
 
-#### Option B (MVP for this spec): native REXD `fs.edit` and `fs.patch`
+#### Option B (recommended for this spec): native REXD `fs.edit` and `fs.patch`
 - Add protocol methods to REXD first (if not already present):
   - `fs.edit` (structured exact replace / edit op)
   - `fs.patch` (unified diff patch application)
@@ -364,11 +364,11 @@ Why this is better for your goal:
 - avoids wrapper-side diff logic drift
 - makes future harness adapters simpler (Claude/Codex/etc. reuse the same server methods)
 
-MVP implication:
+Implementation implication:
 - Implement `fs.edit` / `fs.patch` in REXD before finalizing OpenCode adapter parity.
 - Until those methods land, `edit` / `patch` in the adapter should be marked not-yet-enabled (rather than emulated locally).
 
-## SSH stdio Transport (MVP)
+## SSH stdio Transport
 
 ## Why SSH first
 
@@ -398,11 +398,11 @@ If connection drops:
 
 ---
 
-## PTY Support (MVP)
+## PTY Support
 
 REXD already supports PTY; OpenCode’s default `bash` UX does not cover interactive/background PTY workflows.
 
-So expose dedicated PTY tools (MVP):
+So expose dedicated PTY tools:
 - `pty_spawn` → `pty.open`
 - `pty_write` → `pty.input`
 - `pty_read` → buffered reads from streamed `pty.output`
@@ -427,7 +427,7 @@ OpenCode’s local `external_directory` permission model is based on the local w
 
 So the adapter must enforce a **remote equivalent** explicitly.
 
-## Remote workspace guard (MVP)
+## Remote workspace guard
 
 Treat `workspaceRoots` as the **default remote workspace** (UX boundary), but make escape behavior configurable.
 
@@ -461,7 +461,7 @@ The wrappers should additionally enforce remote-root checks before calling REXD.
 
 ---
 
-## File Parity Strategy (practical MVP cut)
+## File Parity Strategy
 
 This spec now assumes **native REXD edit/patch** for parity.
 
@@ -472,7 +472,7 @@ Add and document:
 
 Once those exist, the OpenCode adapter wraps them directly.
 
-### MVP-1 (must have for remote-first workflow)
+### Phase 1 (must have for remote-first workflow)
 - `bash`
 - `read`
 - `write`
@@ -483,11 +483,11 @@ Once those exist, the OpenCode adapter wraps them directly.
 - SSH stdio transport
 - PTY tools (`pty_*`)
 
-### MVP-2 (complete file parity, depends on REXD methods)
+### Phase 2 (complete file parity, depends on REXD methods)
 - `edit` → native `fs.edit`
 - `patch` → native `fs.patch`
 
-If you add `fs.edit/fs.patch` immediately in REXD, merge MVP-2 into MVP-1.
+If you add `fs.edit/fs.patch` immediately in REXD, merge Phase 2 into Phase 1.
 
 ## Minimal Internal Modules
 
@@ -497,7 +497,7 @@ If you add `fs.edit/fs.patch` immediately in REXD, merge MVP-2 into MVP-1.
    - resolve alias
 
 2. `state.ts`
-   - project/global state read/write
+   - session/global state read/write
    - active target get/set/clear
 
 3. `command-handler.ts`
@@ -514,7 +514,7 @@ If you add `fs.edit/fs.patch` immediately in REXD, merge MVP-2 into MVP-1.
    - request/response map
    - reconnect
 
-6. `transport/http.ts` (optional in MVP)
+6. `transport/http.ts` (optional in a later phase)
 7. `rexd-client.ts`
    - protocol helpers: `session.open`, `exec.start`, `fs.read`, `fs.write`, `fs.list`, `fs.glob`, `fs.edit`, `fs.patch`, `pty.*`
 
@@ -560,7 +560,7 @@ If you add `fs.edit/fs.patch` immediately in REXD, merge MVP-2 into MVP-1.
 
 ---
 
-## Test Plan (MVP)
+## Test Plan
 
 ## Manual tests
 
@@ -642,7 +642,7 @@ If maintenance becomes annoying across adapters, extract a shared `@rexd/client`
 ## Recommended Build Order (your shortest path)
 
 1. Add native `fs.edit` / `fs.patch` to REXD + protocol docs
-2. `/target` plugin command + project state
+2. `/target` plugin command + session state
 3. SSH stdio transport (`ssh ... rexd --stdio`)
 4. Transparent `bash` override
 5. `read` / `write` / `list` / `glob` overrides
@@ -653,15 +653,15 @@ If maintenance becomes annoying across adapters, extract a shared `@rexd/client`
 
 ---
 
-## Acceptance Criteria (Revised MVP)
+## Acceptance Criteria
 
-- `/target use <alias>` activates a remote machine for the current project
+- `/target use <alias>` activates a remote machine for the current chat session
 - Agent continues using normal OpenCode tool names (`bash`, `read`, `write`, etc.)
 - Those tools transparently operate on the remote target via REXD
 - SSH stdio is the default working transport
 - Remote filesystem operations follow per-target remote path policy (`strict` by default), with the remote REXD server allowlist as the hard boundary
 - PTY workflows are available through plugin PTY tools
-- Active target state survives OpenCode restart (project-level)
+- Active target state survives OpenCode restart for that chat session
 
 ---
 
@@ -719,7 +719,7 @@ This is the practical skeleton to implement next in OpenCode.
 1. `tui.command.execute`
    - detect the marker from `target.md`
    - parse subcommands `list`, `use`, `status`, `clear`
-   - read and write project state in `.opencode/rexd-state.json`
+   - read and write session state in `~/.config/opencode/rexd-target/sessions/<sha256(sessionID)>.json`
    - return short messages without relying on the model
 
 2. `tui.prompt.append`
@@ -738,8 +738,8 @@ This is the practical skeleton to implement next in OpenCode.
 - `listTargets()`
 
 `state.ts`
-- read project state from `.opencode/rexd-state.json`
-- `setProjectTarget(projectDir, alias)`
+- read session state from `~/.config/opencode/rexd-target/sessions/<sha256(sessionID)>.json`
+- `setSessionTarget(sessionID, alias)`
 - optional global default later
 
 `path-guard.ts`
@@ -776,7 +776,7 @@ This is the practical skeleton to implement next in OpenCode.
 Each OpenCode tool wrapper should follow the same pattern.
 
 `bash.ts`
-- read active target from project state
+- read active target from session state
 - load target config from registry
 - resolve remote cwd
 - call `execShell(...)`
@@ -827,7 +827,7 @@ Add dedicated PTY tools because built in `bash` is not enough for interactive se
 
 ### First proof test
 
-- Start OpenCode locally in a project
+- Start OpenCode locally in a repo
 - Run `/target use b`
 - Ask for `pwd`
 - Ask for `hostname`
@@ -845,4 +845,3 @@ It preserves the exact mental model you want:
 - generic execution plane (REXD) with harness adapters on top
 
 This is the right architectural direction.
-

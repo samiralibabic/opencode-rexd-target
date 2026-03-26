@@ -43,7 +43,7 @@ curl -fsSL https://raw.githubusercontent.com/samiralibabic/opencode-rexd-target/
 Pinned version:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/samiralibabic/opencode-rexd-target/main/scripts/install.sh | OPENCODE_REXD_TARGET_VERSION=v0.2.7 bash
+curl -fsSL https://raw.githubusercontent.com/samiralibabic/opencode-rexd-target/main/scripts/install.sh | OPENCODE_REXD_TARGET_VERSION=v0.3.0 bash
 ```
 
 The installer places files in your OpenCode config directory:
@@ -92,7 +92,7 @@ In OpenCode:
 - `/target status`
 - `/target clear`
 
-Active target state is persisted per project at `.opencode/rexd-state.json`.
+Active target state is persisted per chat session under `~/.config/opencode/rexd-target/sessions/`.
 
 ## Updating (existing users)
 
@@ -101,7 +101,7 @@ Update in this order:
 1. Update `rexd` on remote target hosts.
 2. Update this plugin locally.
 3. Restart OpenCode.
-4. Reconnect with `/target clear` and `/target use <alias>`.
+4. Reconnect in each chat with `/target use <alias>`.
 
 Update commands:
 
@@ -110,10 +110,12 @@ Update commands:
 curl -fsSL https://raw.githubusercontent.com/samiralibabic/rexd/main/scripts/install.sh | REXD_VERSION=v0.1.4 bash
 
 # 2) local plugin
-curl -fsSL https://raw.githubusercontent.com/samiralibabic/opencode-rexd-target/main/scripts/install.sh | OPENCODE_REXD_TARGET_VERSION=v0.2.7 bash
+curl -fsSL https://raw.githubusercontent.com/samiralibabic/opencode-rexd-target/main/scripts/install.sh | OPENCODE_REXD_TARGET_VERSION=v0.3.0 bash
 ```
 
 If you update the plugin before `rexd`, remote `edit`/`apply_patch` calls can fail with method-not-found errors on older servers.
+
+If your repo still has an old `.opencode/rexd-state.json` from previous versions, it can be removed.
 
 Note: this plugin now preserves OpenCode UI metadata for `edit` and `apply_patch` so TUI diff rendering works the same way as native tools.
 

@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.3.0 - 2026-03-26
+
+- Scope active target selection and connection reuse by OpenCode chat session instead of project directory.
+- Persist session state under `~/.config/opencode/rexd-target/sessions/` using hashed session filenames and opportunistic stale-state pruning.
+- Rename the spec document to remove MVP naming and update docs for the session-scoped behavior.
+
 ## v0.2.7 - 2026-03-19
 
 - Add target-level `loginShell` compatibility setting in `targets.json`.

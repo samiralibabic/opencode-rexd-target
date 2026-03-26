@@ -9,13 +9,15 @@ import {
   writeFileSync,
 } from "node:fs"
 import { spawn } from "node:child_process"
+import { createHash } from "node:crypto"
 import { homedir } from "node:os"
 import { dirname, isAbsolute, posix, relative, resolve } from "node:path"
 import { createTwoFilesPatch } from "diff"
 
 const TARGETS_PATH = resolve(homedir(), ".config/rexd/targets.json")
-const STATE_DIR = ".opencode"
-const STATE_FILE = "rexd-state.json"
+const SESSION_STATE_ROOT = resolve(homedir(), ".config/opencode/rexd-target/sessions")
+const SESSION_STATE_TTL_MS = 1000 * 60 * 60 * 24 * 90
+const CLIENT_VERSION = "0.3.0"
 
 type TargetConfig = {
   transport: "ssh" | "http" | "ws"
@@ -33,7 +35,7 @@ type TargetConfig = {
   sshOptions?: string[]
 }
 
-type ProjectState = {
+type SessionState = {
   activeTargetAlias: string | null
   remoteCwdOverride?: string | null
   lastUsedAt: number
@@ -58,7 +60,7 @@ type ExitWaiter = {
 
 type Connection = {
   key: string
-  projectDir: string
+  opencodeSessionID: string
   alias: string
   target: TargetConfig
   proc: ReturnType<typeof spawn>
@@ -66,7 +68,7 @@ type Connection = {
   requestID: number
   pending: Map<number, PendingRequest>
   closed: boolean
-  sessionID: string
+  remoteSessionID: string
   cwd: string
   workspaceRoots: string[]
   execBuffers: Map<string, ExecBuffer>
@@ -177,32 +179,67 @@ function getTarget(alias: string): TargetConfig | null {
   return targetsCache.get(alias) ?? null
 }
 
-function statePath(projectDir: string): string {
-  return resolve(projectDir, STATE_DIR, STATE_FILE)
+function sessionFileName(opencodeSessionID: string): string {
+  return `${createHash("sha256").update(opencodeSessionID).digest("hex")}.json`
 }
 
-function loadState(projectDir: string): ProjectState {
-  const path = statePath(projectDir)
+function sessionStatePath(opencodeSessionID: string): string {
+  return resolve(SESSION_STATE_ROOT, sessionFileName(opencodeSessionID))
+}
+
+function defaultSessionState(): SessionState {
+  return {
+    activeTargetAlias: null,
+    remoteCwdOverride: null,
+    lastUsedAt: Date.now(),
+  }
+}
+
+function loadSessionState(opencodeSessionID: string): SessionState {
+  const path = sessionStatePath(opencodeSessionID)
   if (!existsSync(path)) {
-    return { activeTargetAlias: null, lastUsedAt: Date.now() }
+    return defaultSessionState()
   }
 
   try {
-    const parsed = JSON.parse(readFileSync(path, "utf-8")) as ProjectState
+    const parsed = JSON.parse(readFileSync(path, "utf-8")) as SessionState
     return {
       activeTargetAlias: parsed.activeTargetAlias ?? null,
       remoteCwdOverride: parsed.remoteCwdOverride ?? null,
       lastUsedAt: parsed.lastUsedAt ?? Date.now(),
     }
   } catch {
-    return { activeTargetAlias: null, lastUsedAt: Date.now() }
+    return defaultSessionState()
   }
 }
 
-function saveState(projectDir: string, state: ProjectState): void {
-  const dir = resolve(projectDir, STATE_DIR)
-  if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
-  writeFileSync(statePath(projectDir), JSON.stringify(state, null, 2))
+function saveSessionState(opencodeSessionID: string, state: SessionState): void {
+  if (!existsSync(SESSION_STATE_ROOT)) mkdirSync(SESSION_STATE_ROOT, { recursive: true })
+  writeFileSync(sessionStatePath(opencodeSessionID), JSON.stringify(state, null, 2))
+}
+
+function pruneSessionStateFiles(now = Date.now()): void {
+  if (!existsSync(SESSION_STATE_ROOT)) return
+
+  for (const entry of readdirSync(SESSION_STATE_ROOT)) {
+    if (!entry.endsWith(".json")) continue
+
+    const path = resolve(SESSION_STATE_ROOT, entry)
+    try {
+      const stats = statSync(path)
+      if (!stats.isFile()) continue
+
+      let lastUsedAt = stats.mtimeMs
+      try {
+        const parsed = JSON.parse(readFileSync(path, "utf-8")) as Partial<SessionState>
+        if (typeof parsed.lastUsedAt === "number" && Number.isFinite(parsed.lastUsedAt)) {
+          lastUsedAt = parsed.lastUsedAt
+        }
+      } catch {}
+
+      if (now - lastUsedAt > SESSION_STATE_TTL_MS) unlinkSync(path)
+    } catch {}
+  }
 }
 
 function parseTargetCommand(input: { command: string; arguments: string }): {
@@ -786,7 +823,7 @@ function buildLocalPatchUiFiles(baseDir: string, patchText: string, worktree: st
 
 async function readRemoteFile(connection: Connection, path: string): Promise<string> {
   const response = await rpcRequest(connection, "fs.read", {
-    session_id: connection.sessionID,
+    session_id: connection.remoteSessionID,
     path,
   })
   const encoding = String(response?.encoding ?? "utf8")
@@ -935,8 +972,8 @@ function guardRemotePatch(
   return null
 }
 
-function connectionKey(projectDir: string, alias: string): string {
-  return `${projectDir}::${alias}`
+function connectionKey(opencodeSessionID: string, alias: string): string {
+  return `${opencodeSessionID}::${alias}`
 }
 
 function isAlive(connection: Connection): boolean {
@@ -1080,12 +1117,16 @@ async function rpcRequest(
   })
 }
 
-async function createConnection(projectDir: string, alias: string, target: TargetConfig): Promise<Connection> {
+async function createConnection(
+  opencodeSessionID: string,
+  alias: string,
+  target: TargetConfig,
+): Promise<Connection> {
   if (!target.host) {
     throw new Error(`Target \"${alias}\" is missing \"host\"`)
   }
 
-  const key = connectionKey(projectDir, alias)
+  const key = connectionKey(opencodeSessionID, alias)
   const existing = connections.get(key)
   if (existing) closeConnection(existing)
 
@@ -1100,7 +1141,7 @@ async function createConnection(projectDir: string, alias: string, target: Targe
   const proc = spawn("ssh", args, { stdio: ["pipe", "pipe", "pipe"] })
   const connection: Connection = {
     key,
-    projectDir,
+    opencodeSessionID,
     alias,
     target,
     proc,
@@ -1108,7 +1149,7 @@ async function createConnection(projectDir: string, alias: string, target: Targe
     requestID: 0,
     pending: new Map(),
     closed: false,
-    sessionID: "",
+    remoteSessionID: "",
     cwd: target.defaultCwd ?? "/",
     workspaceRoots: target.workspaceRoots ?? [],
     execBuffers: new Map(),
@@ -1142,16 +1183,16 @@ async function createConnection(projectDir: string, alias: string, target: Targe
   const session = await rpcRequest(
     connection,
       "session.open",
-      {
-        client_name: "opencode-rexd-target",
-        client_version: "0.2.6",
-        workspace_roots: target.workspaceRoots,
-      },
+        {
+          client_name: "opencode-rexd-target",
+          client_version: CLIENT_VERSION,
+          workspace_roots: target.workspaceRoots,
+        },
       20000,
   )
 
-  connection.sessionID = String(session?.session_id ?? "")
-  if (!connection.sessionID) {
+  connection.remoteSessionID = String(session?.session_id ?? "")
+  if (!connection.remoteSessionID) {
     closeConnection(connection, "session.open did not return session_id")
     throw new Error("session.open failed: missing session_id")
   }
@@ -1167,8 +1208,8 @@ async function createConnection(projectDir: string, alias: string, target: Targe
   return connection
 }
 
-async function ensureConnection(projectDir: string): Promise<Connection> {
-  const state = loadState(projectDir)
+async function ensureConnection(opencodeSessionID: string): Promise<Connection> {
+  const state = loadSessionState(opencodeSessionID)
   if (!state.activeTargetAlias) {
     throw new Error("No active target. Use /target use <alias> first.")
   }
@@ -1182,23 +1223,23 @@ async function ensureConnection(projectDir: string): Promise<Connection> {
     throw new Error(`Target \"${state.activeTargetAlias}\" uses unsupported transport \"${target.transport}\".`)
   }
 
-  const key = connectionKey(projectDir, state.activeTargetAlias)
+  const key = connectionKey(opencodeSessionID, state.activeTargetAlias)
   const existing = connections.get(key)
   if (existing && isAlive(existing)) {
     return existing
   }
 
-  return await createConnection(projectDir, state.activeTargetAlias, target)
+  return await createConnection(opencodeSessionID, state.activeTargetAlias, target)
 }
 
-function getPtyNoRemoteTargetMessage(projectDir: string): string | null {
-  const state = loadState(projectDir)
+function getPtyNoRemoteTargetMessage(opencodeSessionID: string): string | null {
+  const state = loadSessionState(opencodeSessionID)
   if (state.activeTargetAlias) return null
-  return "No remote target selected. PTY is remote-only. Commands run locally. Use /target use <alias> for a remote target."
+  return "No remote target selected for this chat. PTY is remote-only. Commands run locally. Use /target use <alias> for a remote target."
 }
 
-function disconnectAlias(projectDir: string, alias: string): void {
-  const key = connectionKey(projectDir, alias)
+function disconnectAlias(opencodeSessionID: string, alias: string): void {
+  const key = connectionKey(opencodeSessionID, alias)
   const connection = connections.get(key)
   if (connection) closeConnection(connection, "Disconnected")
 }
@@ -1276,7 +1317,7 @@ async function runRemoteExec(
     connection,
     "exec.start",
     {
-      session_id: connection.sessionID,
+      session_id: connection.remoteSessionID,
       command,
       shell: true,
       ...(login ? { login: true } : {}),
@@ -1312,11 +1353,11 @@ function renderExecResult(stdout: string, stderr: string, exitCode: number): str
   return exitCode === 0 ? "(no output)" : `[exit code: ${exitCode}]`
 }
 
-async function handleTargetSubcommand(projectDir: string, subcommand: string, alias?: string): Promise<string> {
+async function handleTargetSubcommand(opencodeSessionID: string, subcommand: string, alias?: string): Promise<string> {
   switch (subcommand) {
     case "list": {
       const targets = loadTargets()
-      const state = loadState(projectDir)
+      const state = loadSessionState(opencodeSessionID)
       const list = Object.entries(targets)
         .map(([name, config]) => {
           const active = state.activeTargetAlias === name ? "*" : " "
@@ -1329,7 +1370,7 @@ async function handleTargetSubcommand(projectDir: string, subcommand: string, al
         return "No targets configured. Create ~/.config/rexd/targets.json"
       }
 
-      return `Available targets:\n${list}\n\nUse /target use <alias> to select a target.`
+      return `Available targets:\n${list}\n\nUse /target use <alias> to select a target for this chat.`
     }
 
     case "use": {
@@ -1342,34 +1383,36 @@ async function handleTargetSubcommand(projectDir: string, subcommand: string, al
         return `Target \"${alias}\" uses unsupported transport \"${target.transport}\".`
       }
 
-      const previous = loadState(projectDir).activeTargetAlias
+      pruneSessionStateFiles()
+
+      const previous = loadSessionState(opencodeSessionID).activeTargetAlias
       try {
-        await createConnection(projectDir, alias, target)
+        await createConnection(opencodeSessionID, alias, target)
       } catch (error) {
         return `Failed to connect to target \"${alias}\": ${error instanceof Error ? error.message : String(error)}`
       }
 
-      if (previous && previous !== alias) disconnectAlias(projectDir, previous)
+      if (previous && previous !== alias) disconnectAlias(opencodeSessionID, previous)
 
-      const state = loadState(projectDir)
+      const state = loadSessionState(opencodeSessionID)
       state.activeTargetAlias = alias
       state.lastUsedAt = Date.now()
-      saveState(projectDir, state)
+      saveSessionState(opencodeSessionID, state)
 
       const roots = target.workspaceRoots?.join(", ") || "N/A"
-      return `Target \"${alias}\" activated.\n\nWorkspace roots: ${roots}\n\nAll file and shell operations now route to the remote machine.`
+      return `Target \"${alias}\" activated for this chat.\n\nWorkspace roots: ${roots}\n\nAll file and shell operations now route to the remote machine.`
     }
 
     case "status": {
-      const state = loadState(projectDir)
+      const state = loadSessionState(opencodeSessionID)
       if (!state.activeTargetAlias) {
-        return "No remote target selected. Commands run locally. Use /target use <alias> for a remote target."
+        return "No remote target selected for this chat. Commands run locally. Use /target use <alias> for a remote target."
       }
 
       const target = getTarget(state.activeTargetAlias)
       const host = target?.host || "unknown"
       const userPrefix = target?.user ? `${target.user}@` : ""
-      const key = connectionKey(projectDir, state.activeTargetAlias)
+      const key = connectionKey(opencodeSessionID, state.activeTargetAlias)
       const connection = connections.get(key)
       const runtime = connection && isAlive(connection) ? "connected" : "disconnected"
 
@@ -1377,17 +1420,17 @@ async function handleTargetSubcommand(projectDir: string, subcommand: string, al
     }
 
     case "clear": {
-      const state = loadState(projectDir)
-      if (!state.activeTargetAlias) return "No active target to clear."
+      const state = loadSessionState(opencodeSessionID)
+      if (!state.activeTargetAlias) return "No active target to clear for this chat."
 
       const previous = state.activeTargetAlias
-      disconnectAlias(projectDir, previous)
+      disconnectAlias(opencodeSessionID, previous)
 
       state.activeTargetAlias = null
       state.remoteCwdOverride = null
       state.lastUsedAt = Date.now()
-      saveState(projectDir, state)
-      return `Target \"${previous}\" deactivated. Operations now use local execution.`
+      saveSessionState(opencodeSessionID, state)
+      return `Target \"${previous}\" deactivated for this chat. Operations now use local execution.`
     }
 
     default:
@@ -1395,13 +1438,15 @@ async function handleTargetSubcommand(projectDir: string, subcommand: string, al
   }
 }
 
-export const RexdTargetPlugin: Plugin = async ({ directory }) => {
+export const RexdTargetPlugin: Plugin = async () => {
+  pruneSessionStateFiles()
+
   return {
     "command.execute.before": async (input, output) => {
       const parsed = parseTargetCommand(input)
       if (!parsed) return
 
-      const message = await handleTargetSubcommand(directory, parsed.subcommand, parsed.alias)
+      const message = await handleTargetSubcommand(input.sessionID, parsed.subcommand, parsed.alias)
       setCommandText(output, message)
     },
 
@@ -1431,7 +1476,7 @@ export const RexdTargetPlugin: Plugin = async ({ directory }) => {
           alias: tool.schema.string().optional().describe("Target alias for use"),
         },
         async execute(args, context: ToolContext) {
-          return await handleTargetSubcommand(context.directory, args.action, args.alias)
+          return await handleTargetSubcommand(context.sessionID, args.action, args.alias)
         },
       }),
 
@@ -1444,14 +1489,14 @@ export const RexdTargetPlugin: Plugin = async ({ directory }) => {
           workdir: tool.schema.string().optional().describe("Working directory"),
         },
         async execute(args, context: ToolContext) {
-          const state = loadState(context.directory)
+          const state = loadSessionState(context.sessionID)
           if (!state.activeTargetAlias) {
             const cwd = args.workdir ? localPath(context.directory, args.workdir) : context.directory
             const result = await runLocalExec(args.command, { cwd, timeoutMs: args.timeout_ms })
             return renderExecResult(result.stdout, result.stderr, result.exitCode)
           }
 
-          const connection = await ensureConnection(context.directory)
+          const connection = await ensureConnection(context.sessionID)
           const remoteCwd = args.workdir ? remotePath(connection.cwd, args.workdir) : connection.cwd
           const guardError = guardRemotePath(connection.target, remoteCwd, connection.workspaceRoots)
           if (guardError) return guardError
@@ -1472,20 +1517,20 @@ export const RexdTargetPlugin: Plugin = async ({ directory }) => {
           limit: tool.schema.number().optional().describe("Max lines to return"),
         },
         async execute(args, context: ToolContext) {
-          const state = loadState(context.directory)
+          const state = loadSessionState(context.sessionID)
           if (!state.activeTargetAlias) {
             const path = localPath(context.directory, args.filePath)
             const content = readFileSync(path, "utf-8")
             return formatReadOutput(content, args.offset, args.limit)
           }
 
-          const connection = await ensureConnection(context.directory)
+          const connection = await ensureConnection(context.sessionID)
           const path = remotePath(connection.cwd, args.filePath)
           const guardError = guardRemotePath(connection.target, path, connection.workspaceRoots)
           if (guardError) return guardError
 
           const response = await rpcRequest(connection, "fs.read", {
-            session_id: connection.sessionID,
+            session_id: connection.remoteSessionID,
             path,
           })
           const encoding = String(response?.encoding ?? "utf8")
@@ -1502,7 +1547,7 @@ export const RexdTargetPlugin: Plugin = async ({ directory }) => {
           content: tool.schema.string().describe("File content"),
         },
         async execute(args, context: ToolContext) {
-          const state = loadState(context.directory)
+          const state = loadSessionState(context.sessionID)
           if (!state.activeTargetAlias) {
             const path = localPath(context.directory, args.filePath)
             const dir = dirname(path)
@@ -1511,13 +1556,13 @@ export const RexdTargetPlugin: Plugin = async ({ directory }) => {
             return `Wrote ${args.filePath}`
           }
 
-          const connection = await ensureConnection(context.directory)
+          const connection = await ensureConnection(context.sessionID)
           const path = remotePath(connection.cwd, args.filePath)
           const guardError = guardRemotePath(connection.target, path, connection.workspaceRoots)
           if (guardError) return guardError
 
           await rpcRequest(connection, "fs.write", {
-            session_id: connection.sessionID,
+            session_id: connection.remoteSessionID,
             path,
             content: args.content,
             mode: "replace",
@@ -1537,7 +1582,7 @@ export const RexdTargetPlugin: Plugin = async ({ directory }) => {
           replaceAll: tool.schema.boolean().optional().describe("Replace all matches"),
         },
         async execute(args, context: ToolContext) {
-          const state = loadState(context.directory)
+          const state = loadSessionState(context.sessionID)
           if (!state.activeTargetAlias) {
             const path = localPath(context.directory, args.filePath)
             const existed = existsSync(path)
@@ -1558,7 +1603,7 @@ export const RexdTargetPlugin: Plugin = async ({ directory }) => {
             return `Edited ${args.filePath} (${edited.replacements} replacement${edited.replacements === 1 ? "" : "s"})`
           }
 
-          const connection = await ensureConnection(context.directory)
+          const connection = await ensureConnection(context.sessionID)
           const path = remotePath(connection.cwd, args.filePath)
           const guardError = guardRemotePath(connection.target, path, connection.workspaceRoots)
           if (guardError) return guardError
@@ -1576,7 +1621,7 @@ export const RexdTargetPlugin: Plugin = async ({ directory }) => {
           } catch {}
 
           const response = await rpcRequest(connection, "fs.edit", {
-            session_id: connection.sessionID,
+            session_id: connection.remoteSessionID,
             path,
             old_string: args.oldString,
             new_string: args.newString,
@@ -1601,7 +1646,7 @@ export const RexdTargetPlugin: Plugin = async ({ directory }) => {
           patchText: tool.schema.string().describe("Patch text in apply_patch envelope format"),
         },
         async execute(args, context: ToolContext) {
-          const state = loadState(context.directory)
+          const state = loadSessionState(context.sessionID)
           if (!state.activeTargetAlias) {
             let files: PatchUiFile[] | undefined
             try {
@@ -1620,7 +1665,7 @@ export const RexdTargetPlugin: Plugin = async ({ directory }) => {
             return renderPatchSummary(summary)
           }
 
-          const connection = await ensureConnection(context.directory)
+          const connection = await ensureConnection(context.sessionID)
           const guardError = guardRemotePatch(
             connection.target,
             connection.cwd,
@@ -1635,7 +1680,7 @@ export const RexdTargetPlugin: Plugin = async ({ directory }) => {
           } catch {}
 
           const response = await rpcRequest(connection, "fs.patch", {
-            session_id: connection.sessionID,
+            session_id: connection.remoteSessionID,
             patch_text: args.patchText,
             cwd: connection.cwd,
           })
@@ -1658,7 +1703,7 @@ export const RexdTargetPlugin: Plugin = async ({ directory }) => {
           filePath: tool.schema.string().optional().describe("Directory path"),
         },
         async execute(args, context: ToolContext) {
-          const state = loadState(context.directory)
+          const state = loadSessionState(context.sessionID)
           if (!state.activeTargetAlias) {
             const path = localPath(context.directory, args.filePath ?? ".")
             const entries = readdirSync(path, { withFileTypes: true })
@@ -1670,13 +1715,13 @@ export const RexdTargetPlugin: Plugin = async ({ directory }) => {
             return formatListEntries(entries)
           }
 
-          const connection = await ensureConnection(context.directory)
+          const connection = await ensureConnection(context.sessionID)
           const path = remotePath(connection.cwd, args.filePath ?? ".")
           const guardError = guardRemotePath(connection.target, path, connection.workspaceRoots)
           if (guardError) return guardError
 
           const response = await rpcRequest(connection, "fs.list", {
-            session_id: connection.sessionID,
+            session_id: connection.remoteSessionID,
             path,
           })
           const entries = Array.isArray(response?.entries)
@@ -1696,7 +1741,7 @@ export const RexdTargetPlugin: Plugin = async ({ directory }) => {
           path: tool.schema.string().optional().describe("Base directory"),
         },
         async execute(args, context: ToolContext) {
-          const state = loadState(context.directory)
+          const state = loadSessionState(context.sessionID)
           if (!state.activeTargetAlias) {
             const cwd = localPath(context.directory, args.path ?? ".")
             const bunGlobal = (globalThis as any).Bun
@@ -1715,13 +1760,13 @@ export const RexdTargetPlugin: Plugin = async ({ directory }) => {
             return result.stdout.trimEnd()
           }
 
-          const connection = await ensureConnection(context.directory)
+          const connection = await ensureConnection(context.sessionID)
           const cwd = remotePath(connection.cwd, args.path ?? ".")
           const guardError = guardRemotePath(connection.target, cwd, connection.workspaceRoots)
           if (guardError) return guardError
 
           const response = await rpcRequest(connection, "fs.glob", {
-            session_id: connection.sessionID,
+            session_id: connection.remoteSessionID,
             pattern: args.pattern,
             cwd,
           })
@@ -1740,7 +1785,7 @@ export const RexdTargetPlugin: Plugin = async ({ directory }) => {
           include: tool.schema.string().optional().describe("Glob include filter"),
         },
         async execute(args, context: ToolContext) {
-          const state = loadState(context.directory)
+          const state = loadSessionState(context.sessionID)
           if (!state.activeTargetAlias) {
             const searchPath = localPath(context.directory, args.path ?? ".")
             let command = `rg -n --color=never ${shellQuote(args.pattern)}`
@@ -1750,7 +1795,7 @@ export const RexdTargetPlugin: Plugin = async ({ directory }) => {
             return renderExecResult(result.stdout, result.stderr, result.exitCode)
           }
 
-          const connection = await ensureConnection(context.directory)
+          const connection = await ensureConnection(context.sessionID)
           const searchPath = remotePath(connection.cwd, args.path ?? ".")
           const guardError = guardRemotePath(connection.target, searchPath, connection.workspaceRoots)
           if (guardError) return guardError
@@ -1772,16 +1817,16 @@ export const RexdTargetPlugin: Plugin = async ({ directory }) => {
           rows: tool.schema.number().optional().describe("Terminal rows"),
         },
         async execute(args, context: ToolContext) {
-          const noRemoteMessage = getPtyNoRemoteTargetMessage(context.directory)
+          const noRemoteMessage = getPtyNoRemoteTargetMessage(context.sessionID)
           if (noRemoteMessage) return noRemoteMessage
 
-          const connection = await ensureConnection(context.directory)
+          const connection = await ensureConnection(context.sessionID)
           if (connection.target.capabilities?.pty === false) {
             return `Target \"${connection.alias}\" does not support PTY.`
           }
 
           const response = await rpcRequest(connection, "pty.open", {
-            session_id: connection.sessionID,
+            session_id: connection.remoteSessionID,
             command: args.command ?? "bash",
             shell: true,
             cwd: connection.cwd,
@@ -1803,12 +1848,12 @@ export const RexdTargetPlugin: Plugin = async ({ directory }) => {
           data: tool.schema.string().describe("Input data"),
         },
         async execute(args, context: ToolContext) {
-          const noRemoteMessage = getPtyNoRemoteTargetMessage(context.directory)
+          const noRemoteMessage = getPtyNoRemoteTargetMessage(context.sessionID)
           if (noRemoteMessage) return noRemoteMessage
 
-          const connection = await ensureConnection(context.directory)
+          const connection = await ensureConnection(context.sessionID)
           await rpcRequest(connection, "pty.input", {
-            session_id: connection.sessionID,
+            session_id: connection.remoteSessionID,
             pty_id: args.id,
             data: args.data,
           })
@@ -1823,10 +1868,10 @@ export const RexdTargetPlugin: Plugin = async ({ directory }) => {
           limit: tool.schema.number().optional().describe("Number of chunks to read"),
         },
         async execute(args, context: ToolContext) {
-          const noRemoteMessage = getPtyNoRemoteTargetMessage(context.directory)
+          const noRemoteMessage = getPtyNoRemoteTargetMessage(context.sessionID)
           if (noRemoteMessage) return noRemoteMessage
 
-          const connection = await ensureConnection(context.directory)
+          const connection = await ensureConnection(context.sessionID)
           const chunks = connection.ptyBuffers.get(args.id) ?? []
           if (!args.limit || args.limit <= 0) return chunks.join("")
           return chunks.slice(-args.limit).join("")
@@ -1837,10 +1882,10 @@ export const RexdTargetPlugin: Plugin = async ({ directory }) => {
         description: "List known PTY sessions",
         args: {},
         async execute(_, context: ToolContext) {
-          const noRemoteMessage = getPtyNoRemoteTargetMessage(context.directory)
+          const noRemoteMessage = getPtyNoRemoteTargetMessage(context.sessionID)
           if (noRemoteMessage) return noRemoteMessage
 
-          const connection = await ensureConnection(context.directory)
+          const connection = await ensureConnection(context.sessionID)
           const ids = [...connection.ptyBuffers.keys()]
           return ids.length > 0 ? ids.join("\n") : "No active PTY sessions"
         },
@@ -1852,12 +1897,12 @@ export const RexdTargetPlugin: Plugin = async ({ directory }) => {
           id: tool.schema.string().describe("PTY id"),
         },
         async execute(args, context: ToolContext) {
-          const noRemoteMessage = getPtyNoRemoteTargetMessage(context.directory)
+          const noRemoteMessage = getPtyNoRemoteTargetMessage(context.sessionID)
           if (noRemoteMessage) return noRemoteMessage
 
-          const connection = await ensureConnection(context.directory)
+          const connection = await ensureConnection(context.sessionID)
           await rpcRequest(connection, "pty.close", {
-            session_id: connection.sessionID,
+            session_id: connection.remoteSessionID,
             pty_id: args.id,
           })
           connection.ptyBuffers.delete(args.id)
