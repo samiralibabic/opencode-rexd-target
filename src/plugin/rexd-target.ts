@@ -17,7 +17,7 @@ import { createTwoFilesPatch } from "diff"
 const TARGETS_PATH = resolve(homedir(), ".config/rexd/targets.json")
 const SESSION_STATE_ROOT = resolve(homedir(), ".config/opencode/rexd-target/sessions")
 const SESSION_STATE_TTL_MS = 1000 * 60 * 60 * 24 * 90
-const CLIENT_VERSION = "0.3.0"
+const CLIENT_VERSION = "0.3.1"
 
 type TargetConfig = {
   transport: "ssh" | "http" | "ws"
@@ -216,6 +216,12 @@ function loadSessionState(opencodeSessionID: string): SessionState {
 function saveSessionState(opencodeSessionID: string, state: SessionState): void {
   if (!existsSync(SESSION_STATE_ROOT)) mkdirSync(SESSION_STATE_ROOT, { recursive: true })
   writeFileSync(sessionStatePath(opencodeSessionID), JSON.stringify(state, null, 2))
+}
+
+function touchSessionState(opencodeSessionID: string, state = loadSessionState(opencodeSessionID)): void {
+  if (!state.activeTargetAlias) return
+  state.lastUsedAt = Date.now()
+  saveSessionState(opencodeSessionID, state)
 }
 
 function pruneSessionStateFiles(now = Date.now()): void {
@@ -1223,6 +1229,8 @@ async function ensureConnection(opencodeSessionID: string): Promise<Connection> 
     throw new Error(`Target \"${state.activeTargetAlias}\" uses unsupported transport \"${target.transport}\".`)
   }
 
+  touchSessionState(opencodeSessionID, state)
+
   const key = connectionKey(opencodeSessionID, state.activeTargetAlias)
   const existing = connections.get(key)
   if (existing && isAlive(existing)) {
@@ -1408,6 +1416,8 @@ async function handleTargetSubcommand(opencodeSessionID: string, subcommand: str
       if (!state.activeTargetAlias) {
         return "No remote target selected for this chat. Commands run locally. Use /target use <alias> for a remote target."
       }
+
+      touchSessionState(opencodeSessionID, state)
 
       const target = getTarget(state.activeTargetAlias)
       const host = target?.host || "unknown"

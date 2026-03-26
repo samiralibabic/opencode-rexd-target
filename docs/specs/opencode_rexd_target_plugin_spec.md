@@ -231,7 +231,7 @@ State must live outside model context and be managed by plugin/tool code.
 Fields:
 - `activeTargetAlias`: string | null
 - `remoteCwdOverride`: string | null (optional)
-- `lastUsedAt`: timestamp
+- `lastUsedAt`: timestamp, refreshed when the chat actively uses or checks its selected target
 
 ### Global state (optional)
 `~/.config/rexd/opencode-state.json`

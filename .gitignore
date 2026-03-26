@@ -1,6 +1,5 @@
 node_modules/
 dist/
-.opencode/rexd-state.json
 *.log
 bun.lock
 release/

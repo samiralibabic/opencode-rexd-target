@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.3.1 - 2026-03-26
+
+- Refresh chat-scoped session `lastUsedAt` during normal target use so active sessions are not pruned as stale after long-lived use.
+- Remove the obsolete repo-local `.opencode/rexd-state.json` ignore entry.
+
 ## v0.3.0 - 2026-03-26
 
 - Scope active target selection and connection reuse by OpenCode chat session instead of project directory.
