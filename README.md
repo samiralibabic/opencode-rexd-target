@@ -43,7 +43,7 @@ curl -fsSL https://raw.githubusercontent.com/samiralibabic/opencode-rexd-target/
 Pinned version:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/samiralibabic/opencode-rexd-target/main/scripts/install.sh | OPENCODE_REXD_TARGET_VERSION=v0.3.1 bash
+curl -fsSL https://raw.githubusercontent.com/samiralibabic/opencode-rexd-target/main/scripts/install.sh | OPENCODE_REXD_TARGET_VERSION=v0.3.3 bash
 ```
 
 The installer places files in your OpenCode config directory:
@@ -110,7 +110,7 @@ Update commands:
 curl -fsSL https://raw.githubusercontent.com/samiralibabic/rexd/main/scripts/install.sh | REXD_VERSION=v0.1.4 bash
 
 # 2) local plugin
-curl -fsSL https://raw.githubusercontent.com/samiralibabic/opencode-rexd-target/main/scripts/install.sh | OPENCODE_REXD_TARGET_VERSION=v0.3.1 bash
+curl -fsSL https://raw.githubusercontent.com/samiralibabic/opencode-rexd-target/main/scripts/install.sh | OPENCODE_REXD_TARGET_VERSION=v0.3.3 bash
 ```
 
 If you update the plugin before `rexd`, remote `edit`/`apply_patch` calls can fail with method-not-found errors on older servers.
