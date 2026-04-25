@@ -1653,7 +1653,7 @@ export const RexdTargetPlugin: Plugin = async () => {
               stageUiState("apply_patch", context, {
                 metadata: {
                   files,
-                  diff: files.map((file) => file.diff).join("\n"),
+                  diff: files.map((file) => file.patch).join("\n"),
                 },
               })
             }
@@ -1684,7 +1684,7 @@ export const RexdTargetPlugin: Plugin = async () => {
             stageUiState("apply_patch", context, {
               metadata: {
                 files,
-                diff: files.map((file) => file.diff).join("\n"),
+                diff: files.map((file) => file.patch).join("\n"),
               },
             })
           }
