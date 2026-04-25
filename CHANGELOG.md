@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.3.3 - 2026-04-25
+
+- Include the local `apply_patch` metadata fix in the release: top-level `metadata.diff` is now built from `files[].patch`.
+- Bump the plugin client version reported to REXD to `0.3.3`.
+
 ## v0.3.2 - 2026-04-25
 
 - Update metadata contract for latest OpenCode (PR #21244): emit `patch` field in per-file diff objects instead of legacy `diff`/`before`/`after` fields.
