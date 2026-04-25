@@ -112,9 +112,7 @@ type PatchUiFile = {
   filePath: string
   relativePath: string
   type: "add" | "update" | "delete" | "move"
-  diff: string
-  before: string
-  after: string
+  patch: string
   additions: number
   deletions: number
   movePath?: string
@@ -777,9 +775,7 @@ function buildLocalPatchUiFiles(baseDir: string, patchText: string, worktree: st
         filePath: sourcePath,
         relativePath: relativeUiPathFromWorktree(worktree, sourcePath, hunk.path),
         type: "add",
-        diff,
-        before,
-        after,
+        patch: diff,
         additions,
         deletions,
       })
@@ -796,9 +792,7 @@ function buildLocalPatchUiFiles(baseDir: string, patchText: string, worktree: st
         filePath: sourcePath,
         relativePath: relativeUiPathFromWorktree(worktree, sourcePath, hunk.path),
         type: "delete",
-        diff,
-        before,
-        after,
+        patch: diff,
         additions,
         deletions,
       })
@@ -815,9 +809,7 @@ function buildLocalPatchUiFiles(baseDir: string, patchText: string, worktree: st
       filePath: sourcePath,
       relativePath: relativeUiPathFromWorktree(worktree, destinationPath, hunk.movePath ?? hunk.path),
       type: hunk.movePath ? "move" : "update",
-      diff,
-      before,
-      after,
+      patch: diff,
       additions,
       deletions,
       movePath: hunk.movePath ? destinationPath : undefined,
@@ -854,9 +846,7 @@ async function buildRemotePatchUiFiles(connection: Connection, patchText: string
         filePath: sourcePath,
         relativePath: relativeUiPathFromCwd(connection.cwd, sourcePath, hunk.path),
         type: "add",
-        diff,
-        before,
-        after,
+        patch: diff,
         additions,
         deletions,
       })
@@ -873,9 +863,7 @@ async function buildRemotePatchUiFiles(connection: Connection, patchText: string
         filePath: sourcePath,
         relativePath: relativeUiPathFromCwd(connection.cwd, sourcePath, hunk.path),
         type: "delete",
-        diff,
-        before,
-        after,
+        patch: diff,
         additions,
         deletions,
       })
@@ -892,9 +880,7 @@ async function buildRemotePatchUiFiles(connection: Connection, patchText: string
       filePath: sourcePath,
       relativePath: relativeUiPathFromCwd(connection.cwd, destinationPath, hunk.movePath ?? hunk.path),
       type: hunk.movePath ? "move" : "update",
-      diff,
-      before,
-      after,
+      patch: diff,
       additions,
       deletions,
       movePath: hunk.movePath ? destinationPath : undefined,
@@ -911,8 +897,7 @@ function buildEditUiMetadata(filePath: string, before: string, after: string) {
     diff,
     filediff: {
       file: filePath,
-      before,
-      after,
+      patch: diff,
       additions,
       deletions,
     },
