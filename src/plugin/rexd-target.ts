@@ -17,7 +17,7 @@ import { createTwoFilesPatch } from "diff"
 const TARGETS_PATH = resolve(homedir(), ".config/rexd/targets.json")
 const SESSION_STATE_ROOT = resolve(homedir(), ".config/opencode/rexd-target/sessions")
 const SESSION_STATE_TTL_MS = 1000 * 60 * 60 * 24 * 90
-const CLIENT_VERSION = "0.3.1"
+const CLIENT_VERSION = "0.3.2"
 
 type TargetConfig = {
   transport: "ssh" | "http" | "ws"
