@@ -322,6 +322,7 @@ function remotePath(cwd: string, inputPath: string): string {
 
 function inRoot(path: string, root: string): boolean {
   const normalizedRoot = normalizeRemotePath(root)
+  if (normalizedRoot === "/") return path.startsWith("/")
   if (path === normalizedRoot) return true
   return path.startsWith(`${normalizedRoot}/`)
 }
