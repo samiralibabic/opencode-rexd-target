@@ -30,7 +30,7 @@ This plugin acts as the OpenCode client layer for REXD targets:
 - OpenCode with plugin support
 - [REXD](https://github.com/samiralibabic/rexd) installed on target hosts and reachable over SSH
 - Target registry at `~/.config/rexd/targets.json`
-- REXD version with `fs.edit` and `fs.patch` support (v0.1.3+). For `loginShell` compatibility mode, use v0.1.4+.
+- REXD v0.1.5+ recommended. `fs.edit` and `fs.patch` require v0.1.3+. `loginShell` compatibility mode requires v0.1.4+.
 
 ## Install
 
@@ -43,7 +43,7 @@ curl -fsSL https://raw.githubusercontent.com/samiralibabic/opencode-rexd-target/
 Pinned version:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/samiralibabic/opencode-rexd-target/main/scripts/install.sh | OPENCODE_REXD_TARGET_VERSION=v0.3.3 bash
+curl -fsSL https://raw.githubusercontent.com/samiralibabic/opencode-rexd-target/main/scripts/install.sh | OPENCODE_REXD_TARGET_VERSION=v0.3.4 bash
 ```
 
 The installer places files in your OpenCode config directory:
@@ -53,7 +53,7 @@ The installer places files in your OpenCode config directory:
 
 ## Post-install setup (required)
 
-1. Ensure every target host runs [REXD](https://github.com/samiralibabic/rexd) `v0.1.4` or newer.
+1. Ensure every target host runs [REXD](https://github.com/samiralibabic/rexd) `v0.1.5` or newer.
 2. Create/update `~/.config/rexd/targets.json` on your local machine.
 3. Restart OpenCode so the plugin is reloaded.
 4. Run `/target list` and then `/target use <alias>`.
@@ -83,6 +83,8 @@ Example `~/.config/rexd/targets.json`:
 - `false` (default): predictable non-login shell execution for automation.
 - `true`: compatibility mode for legacy targets that require login-shell startup files.
 
+`capabilities.shell` controls whether the plugin exposes remote shell execution. Remote shell commands run with the privileges of the remote `rexd` process user and are not constrained by filesystem RPC root guards. Set `capabilities.shell: false` and `security.allow_shell = false` on the target host when filesystem roots must be the hard security boundary.
+
 ## Usage
 
 In OpenCode:
@@ -107,10 +109,10 @@ Update commands:
 
 ```bash
 # 1) remote hosts
-curl -fsSL https://raw.githubusercontent.com/samiralibabic/rexd/main/scripts/install.sh | REXD_VERSION=v0.1.4 bash
+curl -fsSL https://raw.githubusercontent.com/samiralibabic/rexd/main/scripts/install.sh | REXD_VERSION=v0.1.5 bash
 
 # 2) local plugin
-curl -fsSL https://raw.githubusercontent.com/samiralibabic/opencode-rexd-target/main/scripts/install.sh | OPENCODE_REXD_TARGET_VERSION=v0.3.3 bash
+curl -fsSL https://raw.githubusercontent.com/samiralibabic/opencode-rexd-target/main/scripts/install.sh | OPENCODE_REXD_TARGET_VERSION=v0.3.4 bash
 ```
 
 If you update the plugin before `rexd`, remote `edit`/`apply_patch` calls can fail with method-not-found errors on older servers.

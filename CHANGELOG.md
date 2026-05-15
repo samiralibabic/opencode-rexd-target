@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.3.4 - 2026-05-15
+
+- Fix source-side remote path guard when `/` is configured as the workspace root.
+- Update documentation and installer guidance for `rexd v0.1.5`.
+
 ## v0.3.3 - 2026-04-25
 
 - Include the local `apply_patch` metadata fix in the release: top-level `metadata.diff` is now built from `files[].patch`.
