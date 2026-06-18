@@ -1,6 +1,6 @@
 {
   "name": "opencode-rexd-target",
-  "version": "0.3.4",
+  "version": "0.3.5",
   "description": "REXD Target Plugin for OpenCode - transparent remote machine access",
   "main": "dist/index.js",
   "exports": {
@@ -16,6 +16,7 @@
   ],
   "scripts": {
     "build": "bun build ./src/index.ts --outdir ./dist --target node",
+    "test": "bun test",
     "typecheck": "tsc --noEmit",
     "clean": "rm -rf dist"
   },

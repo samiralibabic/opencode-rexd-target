@@ -17,7 +17,40 @@ import { createTwoFilesPatch } from "diff"
 const TARGETS_PATH = resolve(homedir(), ".config/rexd/targets.json")
 const SESSION_STATE_ROOT = resolve(homedir(), ".config/opencode/rexd-target/sessions")
 const SESSION_STATE_TTL_MS = 1000 * 60 * 60 * 24 * 90
-const CLIENT_VERSION = "0.3.4"
+const CLIENT_VERSION = "0.3.5"
+const DEFAULT_READ_LIMIT = 2000
+const SAMPLE_BYTES = 4096
+const SUPPORTED_IMAGE_MIMES = new Set(["image/jpeg", "image/png", "image/gif", "image/webp"])
+const BINARY_EXTENSIONS = new Set([
+  ".zip",
+  ".tar",
+  ".gz",
+  ".exe",
+  ".dll",
+  ".so",
+  ".class",
+  ".jar",
+  ".war",
+  ".7z",
+  ".doc",
+  ".docx",
+  ".xls",
+  ".xlsx",
+  ".ppt",
+  ".pptx",
+  ".odt",
+  ".ods",
+  ".odp",
+  ".bin",
+  ".dat",
+  ".obj",
+  ".o",
+  ".a",
+  ".lib",
+  ".wasm",
+  ".pyc",
+  ".pyo",
+])
 
 type TargetConfig = {
   transport: "ssh" | "http" | "ws"
@@ -117,6 +150,27 @@ type PatchUiFile = {
   deletions: number
   movePath?: string
 }
+
+type ReadArgs = {
+  filePath: string
+  offset?: number
+  limit?: number
+}
+
+type ReadAttachment = {
+  type: "file"
+  mime: string
+  url: string
+}
+
+type ReadToolResult =
+  | string
+  | {
+      title?: string
+      output: string
+      metadata?: Record<string, any>
+      attachments?: ReadAttachment[]
+    }
 
 type StagedUiState = {
   title?: string
@@ -344,7 +398,61 @@ function guardRemotePath(target: TargetConfig, path: string, workspaceRoots: str
   return `Path \"${path}\" is outside allowed roots: ${allRoots.join(", ")}`
 }
 
-function formatReadOutput(content: string, offset?: number, limit?: number): string {
+function startsWith(bytes: Uint8Array, prefix: number[]): boolean {
+  return prefix.every((value, index) => bytes[index] === value)
+}
+
+function mimeFromPath(path: string): string {
+  const lower = path.toLowerCase()
+  if (lower.endsWith(".png")) return "image/png"
+  if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) return "image/jpeg"
+  if (lower.endsWith(".gif")) return "image/gif"
+  if (lower.endsWith(".webp")) return "image/webp"
+  if (lower.endsWith(".pdf")) return "application/pdf"
+  if (lower.endsWith(".bmp")) return "image/bmp"
+  if (lower.endsWith(".svg")) return "image/svg+xml"
+  if (lower.endsWith(".tif") || lower.endsWith(".tiff")) return "image/tiff"
+  if (lower.endsWith(".avif")) return "image/avif"
+  return "application/octet-stream"
+}
+
+export function sniffReadMime(path: string, bytes: Uint8Array): string {
+  if (startsWith(bytes, [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])) return "image/png"
+  if (startsWith(bytes, [0xff, 0xd8, 0xff])) return "image/jpeg"
+  if (startsWith(bytes, [0x47, 0x49, 0x46, 0x38])) return "image/gif"
+  if (startsWith(bytes, [0x42, 0x4d])) return "image/bmp"
+  if (startsWith(bytes, [0x25, 0x50, 0x44, 0x46, 0x2d])) return "application/pdf"
+  if (startsWith(bytes, [0x52, 0x49, 0x46, 0x46]) && startsWith(bytes.subarray(8), [0x57, 0x45, 0x42, 0x50])) {
+    return "image/webp"
+  }
+
+  return mimeFromPath(path)
+}
+
+export function isSupportedReadMedia(mime: string): boolean {
+  return SUPPORTED_IMAGE_MIMES.has(mime) || mime === "application/pdf"
+}
+
+export function isBinaryReadFile(path: string, bytes: Uint8Array): boolean {
+  const lower = path.toLowerCase()
+  for (const ext of BINARY_EXTENSIONS) {
+    if (lower.endsWith(ext)) return true
+  }
+
+  if (bytes.length === 0) return false
+
+  let nonPrintableCount = 0
+  for (let i = 0; i < bytes.length; i++) {
+    if (bytes[i] === 0) return true
+    if (bytes[i] < 9 || (bytes[i] > 13 && bytes[i] < 32)) {
+      nonPrintableCount++
+    }
+  }
+
+  return nonPrintableCount / bytes.length > 0.3
+}
+
+export function formatReadOutput(content: string, offset?: number, limit?: number): string {
   const lines = content.split("\n")
   const start = Math.max(1, offset ?? 1)
   const startIndex = start - 1
@@ -355,10 +463,113 @@ function formatReadOutput(content: string, offset?: number, limit?: number): str
   return sliced.map((line, index) => `${start + index}: ${line}`).join("\n")
 }
 
+function readEntryName(entry: { name: string; type: string }): string {
+  return entry.type === "dir" || entry.type === "directory" ? `${entry.name}/` : entry.name
+}
+
+export function buildDirectoryReadResult(
+  path: string,
+  entries: Array<{ name: string; type: string }>,
+  offset?: number,
+  limit?: number,
+): Exclude<ReadToolResult, string> {
+  const formatted = entries.map(readEntryName).sort((a, b) => a.localeCompare(b))
+  const start = Math.max(1, offset ?? 1)
+  const max = limit && limit > 0 ? limit : DEFAULT_READ_LIMIT
+  const startIndex = start - 1
+  const sliced = formatted.slice(startIndex, startIndex + max)
+  const truncated = startIndex + sliced.length < formatted.length
+
+  return {
+    title: path,
+    output: [
+      `<path>${path}</path>`,
+      `<type>directory</type>`,
+      `<entries>`,
+      sliced.join("\n"),
+      truncated
+        ? `\n(Showing ${sliced.length} of ${formatted.length} entries. Use 'offset' parameter to read beyond entry ${start + sliced.length - 1})`
+        : `\n(${formatted.length} entries)`,
+      `</entries>`,
+    ].join("\n"),
+    metadata: {
+      preview: sliced.slice(0, 20).join("\n"),
+      truncated,
+      loaded: [],
+      display: {
+        type: "directory",
+        path,
+        entries: sliced,
+        offset: start,
+        totalEntries: formatted.length,
+        truncated,
+      },
+    },
+  }
+}
+
+export function buildMediaReadResult(path: string, mime: string, base64: string): Exclude<ReadToolResult, string> {
+  const msg = mime === "application/pdf" ? "PDF read successfully" : "Image read successfully"
+  return {
+    title: path,
+    output: msg,
+    metadata: {
+      preview: msg,
+      truncated: false,
+      loaded: [],
+    },
+    attachments: [
+      {
+        type: "file",
+        mime,
+        url: `data:${mime};base64,${base64}`,
+      },
+    ],
+  }
+}
+
+export function buildRemoteReadRpcParams(input: {
+  sessionID: string
+  path: string
+  encoding?: "utf8" | "base64"
+  length?: number
+}): Record<string, unknown> {
+  return {
+    session_id: input.sessionID,
+    path: input.path,
+    ...(input.encoding ? { encoding: input.encoding } : {}),
+    ...(input.length && input.length > 0 ? { length: input.length } : {}),
+  }
+}
+
+export function readLocalResolvedPath(path: string, args: Pick<ReadArgs, "offset" | "limit"> = {}): ReadToolResult {
+  const stats = statSync(path)
+  if (stats.isDirectory()) {
+    const entries = readdirSync(path, { withFileTypes: true }).map((entry) => ({
+      name: entry.name,
+      type: entry.isDirectory() ? "dir" : "file",
+    }))
+    return buildDirectoryReadResult(path, entries, args.offset, args.limit)
+  }
+
+  const bytes = readFileSync(path)
+  const sample = bytes.subarray(0, SAMPLE_BYTES)
+  const mime = sniffReadMime(path, sample)
+  if (isSupportedReadMedia(mime)) {
+    return buildMediaReadResult(path, mime, bytes.toString("base64"))
+  }
+
+  if (isBinaryReadFile(path, sample)) {
+    throw new Error(`Cannot read binary file: ${path}`)
+  }
+
+  return formatReadOutput(bytes.toString("utf-8"), args.offset, args.limit)
+}
+
 function formatListEntries(entries: Array<{ name: string; type: string }>): string {
   if (entries.length === 0) return ""
   return entries
-    .map((entry) => (entry.type === "dir" ? `${entry.name}/` : entry.name))
+    .map(readEntryName)
     .join("\n")
 }
 
@@ -828,6 +1039,79 @@ async function readRemoteFile(connection: Connection, path: string): Promise<str
   const encoding = String(response?.encoding ?? "utf8")
   const raw = String(response?.content ?? "")
   return decodeData(raw, encoding)
+}
+
+async function readRemoteBase64(connection: Connection, path: string, length?: number): Promise<any> {
+  return await rpcRequest(
+    connection,
+    "fs.read",
+    buildRemoteReadRpcParams({
+      sessionID: connection.remoteSessionID,
+      path,
+      encoding: "base64",
+      length,
+    }),
+  )
+}
+
+async function readRemoteResolvedPath(
+  connection: Connection,
+  path: string,
+  args: Pick<ReadArgs, "offset" | "limit"> = {},
+): Promise<ReadToolResult> {
+  const stat = await rpcRequest(connection, "fs.stat", {
+    session_id: connection.remoteSessionID,
+    path,
+  })
+  if (stat?.exists === false) {
+    throw new Error(`File not found: ${path}`)
+  }
+
+  if (String(stat?.type ?? "file") === "dir") {
+    const response = await rpcRequest(connection, "fs.list", {
+      session_id: connection.remoteSessionID,
+      path,
+    })
+    const entries = Array.isArray(response?.entries)
+      ? response.entries.map((entry: any) => ({
+          name: String(entry?.name ?? ""),
+          type: String(entry?.type ?? "file"),
+        }))
+      : []
+    return buildDirectoryReadResult(path, entries, args.offset, args.limit)
+  }
+
+  const sampleResponse = await readRemoteBase64(connection, path, SAMPLE_BYTES)
+  const sample = Buffer.from(String(sampleResponse?.content ?? ""), "base64")
+  const mime = sniffReadMime(path, sample)
+
+  if (isSupportedReadMedia(mime)) {
+    const response = await readRemoteBase64(connection, path)
+    if (response?.truncated === true) {
+      throw new Error(
+        `Cannot attach media file because REXD truncated the read: ${path}. Increase max_file_read_bytes on the target or use a smaller file.`,
+      )
+    }
+    return buildMediaReadResult(path, mime, String(response?.content ?? ""))
+  }
+
+  if (isBinaryReadFile(path, sample)) {
+    throw new Error(`Cannot read binary file: ${path}`)
+  }
+
+  const response = await rpcRequest(
+    connection,
+    "fs.read",
+    buildRemoteReadRpcParams({
+      sessionID: connection.remoteSessionID,
+      path,
+      encoding: "utf8",
+    }),
+  )
+  const encoding = String(response?.encoding ?? "utf8")
+  const raw = String(response?.content ?? "")
+  const content = decodeData(raw, encoding)
+  return formatReadOutput(content, args.offset, args.limit)
 }
 
 async function buildRemotePatchUiFiles(connection: Connection, patchText: string): Promise<PatchUiFile[]> {
@@ -1516,8 +1800,7 @@ export const RexdTargetPlugin: Plugin = async () => {
           const state = loadSessionState(context.sessionID)
           if (!state.activeTargetAlias) {
             const path = localPath(context.directory, args.filePath)
-            const content = readFileSync(path, "utf-8")
-            return formatReadOutput(content, args.offset, args.limit)
+            return readLocalResolvedPath(path, args) as any
           }
 
           const connection = await ensureConnection(context.sessionID)
@@ -1525,14 +1808,7 @@ export const RexdTargetPlugin: Plugin = async () => {
           const guardError = guardRemotePath(connection.target, path, connection.workspaceRoots)
           if (guardError) return guardError
 
-          const response = await rpcRequest(connection, "fs.read", {
-            session_id: connection.remoteSessionID,
-            path,
-          })
-          const encoding = String(response?.encoding ?? "utf8")
-          const raw = String(response?.content ?? "")
-          const content = decodeData(raw, encoding)
-          return formatReadOutput(content, args.offset, args.limit)
+          return (await readRemoteResolvedPath(connection, path, args)) as any
         },
       }),
 

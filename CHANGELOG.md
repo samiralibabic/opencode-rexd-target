@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.3.5 - 2026-06-18
+
+- Fix `read` tool parity with current OpenCode for images and PDFs: local and remote reads now return media attachments instead of decoding binary data as UTF-8 text.
+- Add directory read output and unsupported-binary rejection to the `read` override.
+- Add first-party Bun coverage for text, directory, media, binary, and remote base64 read helpers.
+
 ## v0.3.4 - 2026-05-15
 
 - Fix source-side remote path guard when `/` is configured as the workspace root.
