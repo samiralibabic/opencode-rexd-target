@@ -1,15 +1,16 @@
-import { tool, type Plugin, type ToolContext } from "@opencode-ai/plugin"
+import { tool, type Plugin, type ToolContext, type ToolResult } from "@opencode-ai/plugin"
 import {
   existsSync,
   mkdirSync,
   readFileSync,
   readdirSync,
+  renameSync,
   statSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs"
 import { spawn } from "node:child_process"
-import { createHash } from "node:crypto"
+import { createHash, randomUUID } from "node:crypto"
 import { homedir } from "node:os"
 import { dirname, isAbsolute, posix, relative, resolve } from "node:path"
 import { createTwoFilesPatch } from "diff"
@@ -17,9 +18,14 @@ import { createTwoFilesPatch } from "diff"
 const TARGETS_PATH = resolve(homedir(), ".config/rexd/targets.json")
 const SESSION_STATE_ROOT = resolve(homedir(), ".config/opencode/rexd-target/sessions")
 const SESSION_STATE_TTL_MS = 1000 * 60 * 60 * 24 * 90
-const CLIENT_VERSION = "0.3.5"
+const CLIENT_VERSION = "0.3.6"
 const DEFAULT_READ_LIMIT = 2000
 const SAMPLE_BYTES = 4096
+const EXEC_OUTPUT_MAX_BYTES = 1024 * 1024
+const EXEC_OUTPUT_MAX_CHUNKS = 4096
+const SSH_STDERR_MAX_BYTES = 16 * 1024
+const RPC_LINE_MAX_BYTES = 1024 * 1024
+const OUTPUT_CAP_MARKER = "[plugin output safety cap reached; additional output dropped]"
 const SUPPORTED_IMAGE_MIMES = new Set(["image/jpeg", "image/png", "image/gif", "image/webp"])
 const BINARY_EXTENSIONS = new Set([
   ".zip",
@@ -52,7 +58,7 @@ const BINARY_EXTENSIONS = new Set([
   ".pyo",
 ])
 
-type TargetConfig = {
+export type TargetConfig = {
   transport: "ssh" | "http" | "ws"
   description?: string
   loginShell?: boolean
@@ -68,7 +74,7 @@ type TargetConfig = {
   sshOptions?: string[]
 }
 
-type SessionState = {
+export type SessionState = {
   activeTargetAlias: string | null
   remoteCwdOverride?: string | null
   lastUsedAt: number
@@ -78,17 +84,27 @@ type PendingRequest = {
   resolve: (value: any) => void
   reject: (err: Error) => void
   timer: Timer
+  cleanup: () => void
 }
 
-type ExecBuffer = {
-  stdout: string[]
-  stderr: string[]
+type OutputStream = "stdout" | "stderr"
+
+export type OutputChunk = {
+  stream: OutputStream
+  data: string
+}
+
+export type ExecBuffer = {
+  chunks: OutputChunk[]
+  bytes: number
+  dropped: boolean
 }
 
 type ExitWaiter = {
   resolve: (value: any) => void
   reject: (err: Error) => void
   timer: Timer
+  cleanup: () => void
 }
 
 type Connection = {
@@ -107,7 +123,8 @@ type Connection = {
   execBuffers: Map<string, ExecBuffer>
   execExits: Map<string, any>
   execExitWaiters: Map<string, ExitWaiter>
-  ptyBuffers: Map<string, string[]>
+  ptyBuffers: Map<string, ExecBuffer>
+  sshStderr: string
 }
 
 type PatchChunk = {
@@ -172,40 +189,8 @@ type ReadToolResult =
       attachments?: ReadAttachment[]
     }
 
-type StagedUiState = {
-  title?: string
-  output?: string
-  metadata?: Record<string, any>
-}
-
 const targetsCache = new Map<string, TargetConfig>()
 const connections = new Map<string, Connection>()
-const stagedUiState = new Map<string, StagedUiState>()
-
-function uiStateKey(toolID: string, sessionID: string, callID?: string): string {
-  return `${sessionID}:${callID ?? ""}:${toolID}`
-}
-
-function getCallID(context: ToolContext): string | undefined {
-  const callID = (context as any).callID
-  if (typeof callID === "string" && callID.length > 0) return callID
-  if (typeof callID === "number") return String(callID)
-  return undefined
-}
-
-function stageUiState(toolID: string, context: ToolContext, state: StagedUiState): void {
-  const callID = getCallID(context)
-  if (!callID) return
-  stagedUiState.set(uiStateKey(toolID, context.sessionID, callID), state)
-}
-
-function consumeUiState(toolID: string, sessionID: string, callID: string): StagedUiState | undefined {
-  const key = uiStateKey(toolID, sessionID, callID)
-  const state = stagedUiState.get(key)
-  if (!state) return undefined
-  stagedUiState.delete(key)
-  return state
-}
 
 function loadTargets(): Record<string, TargetConfig> {
   if (targetsCache.size > 0) return Object.fromEntries(targetsCache)
@@ -235,7 +220,7 @@ function sessionFileName(opencodeSessionID: string): string {
   return `${createHash("sha256").update(opencodeSessionID).digest("hex")}.json`
 }
 
-function sessionStatePath(opencodeSessionID: string): string {
+export function sessionStatePath(opencodeSessionID: string): string {
   return resolve(SESSION_STATE_ROOT, sessionFileName(opencodeSessionID))
 }
 
@@ -247,27 +232,80 @@ function defaultSessionState(): SessionState {
   }
 }
 
-function loadSessionState(opencodeSessionID: string): SessionState {
-  const path = sessionStatePath(opencodeSessionID)
-  if (!existsSync(path)) {
-    return defaultSessionState()
+export function validateSessionState(value: unknown): SessionState {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("Session state is invalid: expected an object")
   }
 
-  try {
-    const parsed = JSON.parse(readFileSync(path, "utf-8")) as SessionState
-    return {
-      activeTargetAlias: parsed.activeTargetAlias ?? null,
-      remoteCwdOverride: parsed.remoteCwdOverride ?? null,
-      lastUsedAt: parsed.lastUsedAt ?? Date.now(),
-    }
-  } catch {
-    return defaultSessionState()
+  const state = value as Record<string, unknown>
+  const keys = Object.keys(state)
+  const allowed = new Set(["activeTargetAlias", "remoteCwdOverride", "lastUsedAt"])
+  if (keys.some((key) => !allowed.has(key))) {
+    throw new Error("Session state is invalid: contains unknown fields")
+  }
+  if (!("activeTargetAlias" in state) || !("lastUsedAt" in state)) {
+    throw new Error("Session state is invalid: missing required fields")
+  }
+  if (state.activeTargetAlias !== null && (typeof state.activeTargetAlias !== "string" || !state.activeTargetAlias)) {
+    throw new Error("Session state is invalid: activeTargetAlias must be a non-empty string or null")
+  }
+  if (state.remoteCwdOverride !== undefined && state.remoteCwdOverride !== null && typeof state.remoteCwdOverride !== "string") {
+    throw new Error("Session state is invalid: remoteCwdOverride must be a string or null")
+  }
+  if (typeof state.lastUsedAt !== "number" || !Number.isFinite(state.lastUsedAt)) {
+    throw new Error("Session state is invalid: lastUsedAt must be a finite number")
+  }
+
+  return {
+    activeTargetAlias: state.activeTargetAlias as string | null,
+    remoteCwdOverride: (state.remoteCwdOverride as string | null | undefined) ?? null,
+    lastUsedAt: state.lastUsedAt as number,
   }
 }
 
+export function loadSessionStateFromPath(path: string): SessionState {
+  try {
+    return validateSessionState(JSON.parse(readFileSync(path, "utf-8")))
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error)
+    throw new Error(`Session state at "${path}" is corrupt or invalid: ${detail}`)
+  }
+}
+
+type SessionStateFileOps = {
+  mkdir?: (path: string, options: { recursive: true }) => void
+  writeFile?: (path: string, content: string) => void
+  rename?: (from: string, to: string) => void
+  unlink?: (path: string) => void
+}
+
+export function saveSessionStateToPath(path: string, state: SessionState, ops: SessionStateFileOps = {}): void {
+  const validated = validateSessionState(state)
+  const mkdir = ops.mkdir ?? ((dir, options) => mkdirSync(dir, options))
+  const writeFile = ops.writeFile ?? ((file, content) => writeFileSync(file, content))
+  const rename = ops.rename ?? renameSync
+  const unlink = ops.unlink ?? unlinkSync
+  const temp = `${path}.${process.pid}.${randomUUID()}.tmp`
+
+  try {
+    mkdir(dirname(path), { recursive: true })
+    writeFile(temp, JSON.stringify(validated, null, 2))
+    rename(temp, path)
+  } catch (error) {
+    try {
+      unlink(temp)
+    } catch {}
+    throw error
+  }
+}
+
+function loadSessionState(opencodeSessionID: string): SessionState {
+  const path = sessionStatePath(opencodeSessionID)
+  return existsSync(path) ? loadSessionStateFromPath(path) : defaultSessionState()
+}
+
 function saveSessionState(opencodeSessionID: string, state: SessionState): void {
-  if (!existsSync(SESSION_STATE_ROOT)) mkdirSync(SESSION_STATE_ROOT, { recursive: true })
-  writeFileSync(sessionStatePath(opencodeSessionID), JSON.stringify(state, null, 2))
+  saveSessionStateToPath(sessionStatePath(opencodeSessionID), state)
 }
 
 function touchSessionState(opencodeSessionID: string, state = loadSessionState(opencodeSessionID)): void {
@@ -287,15 +325,14 @@ function pruneSessionStateFiles(now = Date.now()): void {
       const stats = statSync(path)
       if (!stats.isFile()) continue
 
-      let lastUsedAt = stats.mtimeMs
+      let state: SessionState
       try {
-        const parsed = JSON.parse(readFileSync(path, "utf-8")) as Partial<SessionState>
-        if (typeof parsed.lastUsedAt === "number" && Number.isFinite(parsed.lastUsedAt)) {
-          lastUsedAt = parsed.lastUsedAt
-        }
-      } catch {}
+        state = validateSessionState(JSON.parse(readFileSync(path, "utf-8")))
+      } catch {
+        continue
+      }
 
-      if (now - lastUsedAt > SESSION_STATE_TTL_MS) unlinkSync(path)
+      if (!state.activeTargetAlias && now - state.lastUsedAt > SESSION_STATE_TTL_MS) unlinkSync(path)
     } catch {}
   }
 }
@@ -379,6 +416,265 @@ function inRoot(path: string, root: string): boolean {
   if (normalizedRoot === "/") return path.startsWith("/")
   if (path === normalizedRoot) return true
   return path.startsWith(`${normalizedRoot}/`)
+}
+
+function pathWithin(root: string, path: string): boolean {
+  const rel = relative(resolve(root), resolve(path))
+  return rel === "" || (!rel.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`) && rel !== ".." && !isAbsolute(rel))
+}
+
+function localPathInProject(context: ToolContext, path: string): boolean {
+  if (pathWithin(context.directory, path)) return true
+  return resolve(context.worktree) !== resolve("/") && pathWithin(context.worktree, path)
+}
+
+function localPermissionRoot(context: ToolContext): string {
+  return resolve(context.worktree) === resolve("/") ? context.directory : context.worktree
+}
+
+function localExternalPattern(path: string, kind: "file" | "directory"): string {
+  const dir = kind === "directory" ? path : dirname(path)
+  return resolve(dir, "*").replaceAll("\\", "/")
+}
+
+function remoteExternalPattern(path: string, kind: "file" | "directory"): string {
+  const dir = kind === "directory" ? path : posix.dirname(path)
+  return posix.join(dir, "*")
+}
+
+function throwIfAborted(signal: AbortSignal): void {
+  if (signal.aborted) throw new Error("Operation cancelled")
+}
+
+async function askPermission(
+  context: ToolContext,
+  permission: string,
+  patterns: string[],
+  always: string[],
+  metadata: Record<string, unknown>,
+): Promise<void> {
+  throwIfAborted(context.abort)
+  await context.ask({ permission, patterns, always, metadata })
+  throwIfAborted(context.abort)
+}
+
+export async function askLocalPathPermission(
+  context: ToolContext,
+  permission: string,
+  path: string,
+  metadata: Record<string, unknown> = {},
+  kind: "file" | "directory" = "file",
+): Promise<void> {
+  if (!localPathInProject(context, path)) {
+    const pattern = localExternalPattern(path, kind)
+    await askPermission(context, "external_directory", [pattern], [pattern], {
+      ...metadata,
+      filepath: path,
+      parentDir: kind === "directory" ? path : dirname(path),
+    })
+  }
+  await askPermission(context, permission, [relative(localPermissionRoot(context), path) || "."], ["*"], {
+    ...metadata,
+    filepath: path,
+  })
+}
+
+async function askLocalSearchPermission(
+  context: ToolContext,
+  permission: "glob" | "grep",
+  query: string,
+  path: string,
+  metadata: Record<string, unknown>,
+): Promise<void> {
+  await askPermission(context, permission, [query], ["*"], metadata)
+  if (!localPathInProject(context, path)) {
+    const pattern = localExternalPattern(path, "directory")
+    await askPermission(context, "external_directory", [pattern], [pattern], {
+      ...metadata,
+      filepath: path,
+      parentDir: path,
+    })
+  }
+}
+
+async function askRemoteSearchPermission(
+  context: ToolContext,
+  input: {
+    permission: "glob" | "grep"
+    query: string
+    path: string
+    workspaceRoots: string[]
+    target: string
+    metadata: Record<string, unknown>
+  },
+): Promise<void> {
+  const path = normalizeRemotePath(input.path)
+  await askPermission(context, input.permission, [input.query], ["*"], {
+    ...input.metadata,
+    filepath: path,
+    target: input.target,
+    remote: true,
+  })
+  const roots = input.workspaceRoots.map(normalizeRemotePath)
+  if (roots.length > 0 && !roots.some((root) => inRoot(path, root))) {
+    const pattern = remoteExternalPattern(path, "directory")
+    await askPermission(context, "external_directory", [pattern], [pattern], {
+      ...input.metadata,
+      filepath: path,
+      parentDir: path,
+      target: input.target,
+      remote: true,
+    })
+  }
+}
+
+function shellPaths(command: string, cwd: string, remote: boolean): string[] {
+  const paths = new Set<string>()
+  const pattern = /(?:^|[\s"'=])((?:\/|\.\.?(?:\/|$)|~\/|\$HOME\/|\$\{HOME\}\/)[^\s"';&|<>`()]*?)(?=$|[\s"';&|<>`()])/g
+  for (const match of command.matchAll(pattern)) {
+    const value = match[1]
+    let path: string
+    if (value.startsWith("~/")) {
+      if (remote) continue
+      path = resolve(homedir(), value.slice(2))
+    } else if (value.startsWith("$HOME/") || value.startsWith("${HOME}/")) {
+      if (remote) continue
+      const suffix = value.slice(value.indexOf("/") + 1)
+      path = resolve(homedir(), suffix)
+    } else {
+      path = remote ? remotePath(cwd, value) : resolve(cwd, value)
+    }
+    paths.add(path)
+  }
+  return [...paths]
+}
+
+function shellPermissionPatterns(command: string): string[] {
+  return /[&;|\n`<>]|\$\(/.test(command) ? [command, "*"] : [command]
+}
+
+export async function askRemotePathPermission(
+  context: ToolContext,
+  input: {
+    permission: string
+    path: string
+    workspaceRoots: string[]
+    target: string
+    kind?: "file" | "directory"
+    metadata?: Record<string, unknown>
+  },
+): Promise<void> {
+  const path = normalizeRemotePath(input.path)
+  const kind = input.kind ?? "file"
+  const roots = input.workspaceRoots.map(normalizeRemotePath)
+  if (roots.length > 0 && !roots.some((root) => inRoot(path, root))) {
+    const pattern = remoteExternalPattern(path, kind)
+    await askPermission(context, "external_directory", [pattern], [pattern], {
+      ...(input.metadata ?? {}),
+      filepath: path,
+      parentDir: kind === "directory" ? path : posix.dirname(path),
+      target: input.target,
+      remote: true,
+    })
+  }
+  await askPermission(context, input.permission, [path], ["*"], {
+    ...(input.metadata ?? {}),
+    filepath: path,
+    target: input.target,
+    remote: true,
+  })
+}
+
+export async function askBashPermission(
+  context: ToolContext,
+  command: string,
+  cwd: string,
+  remote?: { target: string; workspaceRoots: string[] },
+): Promise<void> {
+  if (remote) {
+    const roots = remote.workspaceRoots.map(normalizeRemotePath)
+    if (roots.length > 0 && !roots.some((root) => inRoot(cwd, root))) {
+      const pattern = remoteExternalPattern(cwd, "directory")
+      await askPermission(context, "external_directory", [pattern], [pattern], {
+        command,
+        cwd,
+        target: remote.target,
+        remote: true,
+      })
+    }
+    if (/(?:^|[\s"'=])(?:~\/|\$HOME\/|\$\{HOME\}\/)/.test(command)) {
+      await askPermission(context, "external_directory", ["*"], ["*"], {
+        command,
+        filepath: "remote home directory",
+        target: remote.target,
+        remote: true,
+      })
+    }
+    for (const path of shellPaths(command, cwd, true)) {
+      if (roots.some((root) => inRoot(normalizeRemotePath(path), root))) continue
+      const pattern = remoteExternalPattern(normalizeRemotePath(path), "file")
+      await askPermission(context, "external_directory", [pattern], [pattern], {
+        command,
+        filepath: normalizeRemotePath(path),
+        target: remote.target,
+        remote: true,
+      })
+    }
+  } else if (!localPathInProject(context, cwd)) {
+    const pattern = localExternalPattern(cwd, "directory")
+    await askPermission(context, "external_directory", [pattern], [pattern], { command, cwd })
+  }
+
+  if (!remote) {
+    for (const path of shellPaths(command, cwd, false)) {
+      if (localPathInProject(context, path)) continue
+      const pattern = localExternalPattern(path, "file")
+      await askPermission(context, "external_directory", [pattern], [pattern], { command, filepath: path })
+    }
+  }
+
+  await askPermission(context, "bash", shellPermissionPatterns(command), [command], {
+    command,
+    cwd,
+    ...(remote ? { target: remote.target, remote: true } : {}),
+  })
+}
+
+function configuredRemoteCwd(target: TargetConfig): string {
+  return normalizeRemotePath(target.defaultCwd ?? target.workspaceRoots?.[0] ?? "/")
+}
+
+function configuredWorkspaceRoots(target: TargetConfig): string[] {
+  return (target.workspaceRoots ?? []).map(normalizeRemotePath)
+}
+
+export function assertTargetCapabilities(
+  alias: string,
+  target: TargetConfig,
+  required: Array<"shell" | "fs" | "pty">,
+): void {
+  for (const capability of required) {
+    if (target.capabilities?.[capability] === false) {
+      throw new Error(`Target "${alias}" does not support ${capability} operations.`)
+    }
+  }
+}
+
+function configuredActiveTarget(state: SessionState): { alias: string; target: TargetConfig } {
+  if (!state.activeTargetAlias) throw new Error("No active target. Use /target use <alias> first.")
+  const target = getTarget(state.activeTargetAlias)
+  if (!target) throw new Error(`Target "${state.activeTargetAlias}" is not configured.`)
+  if (target.transport !== "ssh") {
+    throw new Error(`Target "${state.activeTargetAlias}" uses unsupported transport "${target.transport}".`)
+  }
+  return { alias: state.activeTargetAlias, target }
+}
+
+export async function executeForSessionState<T>(
+  state: SessionState,
+  handlers: { local: () => Promise<T>; remote: (alias: string) => Promise<T> },
+): Promise<T> {
+  return state.activeTargetAlias ? await handlers.remote(state.activeTargetAlias) : await handlers.local()
 }
 
 function guardRemotePath(target: TargetConfig, path: string, workspaceRoots: string[]): string | null {
@@ -1031,17 +1327,20 @@ function buildLocalPatchUiFiles(baseDir: string, patchText: string, worktree: st
   return files
 }
 
-async function readRemoteFile(connection: Connection, path: string): Promise<string> {
-  const response = await rpcRequest(connection, "fs.read", {
-    session_id: connection.remoteSessionID,
-    path,
-  })
+async function readRemoteFile(connection: Connection, path: string, signal?: AbortSignal): Promise<string> {
+  const response = await rpcRequest(
+    connection,
+    "fs.read",
+    { session_id: connection.remoteSessionID, path },
+    30000,
+    signal,
+  )
   const encoding = String(response?.encoding ?? "utf8")
   const raw = String(response?.content ?? "")
   return decodeData(raw, encoding)
 }
 
-async function readRemoteBase64(connection: Connection, path: string, length?: number): Promise<any> {
+async function readRemoteBase64(connection: Connection, path: string, length?: number, signal?: AbortSignal): Promise<any> {
   return await rpcRequest(
     connection,
     "fs.read",
@@ -1051,6 +1350,8 @@ async function readRemoteBase64(connection: Connection, path: string, length?: n
       encoding: "base64",
       length,
     }),
+    30000,
+    signal,
   )
 }
 
@@ -1058,20 +1359,27 @@ async function readRemoteResolvedPath(
   connection: Connection,
   path: string,
   args: Pick<ReadArgs, "offset" | "limit"> = {},
+  signal?: AbortSignal,
 ): Promise<ReadToolResult> {
-  const stat = await rpcRequest(connection, "fs.stat", {
-    session_id: connection.remoteSessionID,
-    path,
-  })
+  const stat = await rpcRequest(
+    connection,
+    "fs.stat",
+    { session_id: connection.remoteSessionID, path },
+    30000,
+    signal,
+  )
   if (stat?.exists === false) {
     throw new Error(`File not found: ${path}`)
   }
 
   if (String(stat?.type ?? "file") === "dir") {
-    const response = await rpcRequest(connection, "fs.list", {
-      session_id: connection.remoteSessionID,
-      path,
-    })
+    const response = await rpcRequest(
+      connection,
+      "fs.list",
+      { session_id: connection.remoteSessionID, path },
+      30000,
+      signal,
+    )
     const entries = Array.isArray(response?.entries)
       ? response.entries.map((entry: any) => ({
           name: String(entry?.name ?? ""),
@@ -1081,12 +1389,12 @@ async function readRemoteResolvedPath(
     return buildDirectoryReadResult(path, entries, args.offset, args.limit)
   }
 
-  const sampleResponse = await readRemoteBase64(connection, path, SAMPLE_BYTES)
+  const sampleResponse = await readRemoteBase64(connection, path, SAMPLE_BYTES, signal)
   const sample = Buffer.from(String(sampleResponse?.content ?? ""), "base64")
   const mime = sniffReadMime(path, sample)
 
   if (isSupportedReadMedia(mime)) {
-    const response = await readRemoteBase64(connection, path)
+    const response = await readRemoteBase64(connection, path, undefined, signal)
     if (response?.truncated === true) {
       throw new Error(
         `Cannot attach media file because REXD truncated the read: ${path}. Increase max_file_read_bytes on the target or use a smaller file.`,
@@ -1107,6 +1415,8 @@ async function readRemoteResolvedPath(
       path,
       encoding: "utf8",
     }),
+    30000,
+    signal,
   )
   const encoding = String(response?.encoding ?? "utf8")
   const raw = String(response?.content ?? "")
@@ -1114,7 +1424,11 @@ async function readRemoteResolvedPath(
   return formatReadOutput(content, args.offset, args.limit)
 }
 
-async function buildRemotePatchUiFiles(connection: Connection, patchText: string): Promise<PatchUiFile[]> {
+async function buildRemotePatchUiFiles(
+  connection: Connection,
+  patchText: string,
+  signal?: AbortSignal,
+): Promise<PatchUiFile[]> {
   const hunks = parsePatchEnvelope(patchText)
   const files: PatchUiFile[] = []
 
@@ -1139,7 +1453,7 @@ async function buildRemotePatchUiFiles(connection: Connection, patchText: string
     }
 
     if (hunk.type === "delete") {
-      const before = await readRemoteFile(connection, sourcePath)
+      const before = await readRemoteFile(connection, sourcePath, signal)
       const after = ""
       const diff = createUnifiedDiff(sourcePath, `/dev/null`, before, after)
       const { additions, deletions } = countDiffChanges(diff)
@@ -1155,7 +1469,7 @@ async function buildRemotePatchUiFiles(connection: Connection, patchText: string
       continue
     }
 
-    const before = await readRemoteFile(connection, sourcePath)
+    const before = await readRemoteFile(connection, sourcePath, signal)
     const after = hunk.chunks.length > 0 ? derivePatchedContent(before, hunk.chunks) : before
     const destinationPath = hunk.movePath ? remotePath(connection.cwd, hunk.movePath) : sourcePath
     const diff = createUnifiedDiff(sourcePath, destinationPath, before, after)
@@ -1262,15 +1576,20 @@ function closeConnection(connection: Connection, reason?: string): void {
 
   for (const pending of connection.pending.values()) {
     clearTimeout(pending.timer)
+    pending.cleanup()
     pending.reject(new Error(reason ?? "Connection closed"))
   }
   connection.pending.clear()
 
   for (const waiter of connection.execExitWaiters.values()) {
     clearTimeout(waiter.timer)
+    waiter.cleanup()
     waiter.reject(new Error(reason ?? "Connection closed"))
   }
   connection.execExitWaiters.clear()
+  connection.execBuffers.clear()
+  connection.execExits.clear()
+  connection.ptyBuffers.clear()
 
   connections.delete(connection.key)
 
@@ -1278,14 +1597,74 @@ function closeConnection(connection: Connection, reason?: string): void {
     connection.proc.stdin?.end()
   } catch {}
   try {
+    connection.proc.stdout?.removeAllListeners("data")
+    connection.proc.stderr?.removeAllListeners("data")
+  } catch {}
+  try {
     connection.proc.kill()
   } catch {}
+}
+
+export function createExecBuffer(): ExecBuffer {
+  return { chunks: [], bytes: 0, dropped: false }
+}
+
+function takeUtf8Prefix(value: string, maxBytes: number): string {
+  if (maxBytes <= 0) return ""
+  const bytes = Buffer.from(value, "utf8")
+  if (bytes.length <= maxBytes) return value
+  let end = Math.min(maxBytes, bytes.length)
+  while (end > 0 && (bytes[end] & 0xc0) === 0x80) end--
+  return bytes.subarray(0, end).toString("utf8")
+}
+
+export function appendExecOutput(buffer: ExecBuffer, stream: OutputStream, data: string): void {
+  if (!data) return
+  if (buffer.chunks.length >= EXEC_OUTPUT_MAX_CHUNKS) {
+    buffer.dropped = true
+    return
+  }
+  const remaining = EXEC_OUTPUT_MAX_BYTES - buffer.bytes
+  if (remaining <= 0) {
+    buffer.dropped = true
+    return
+  }
+  const kept = takeUtf8Prefix(data, remaining)
+  if (kept) {
+    buffer.chunks.push({ stream, data: kept })
+    buffer.bytes += Buffer.byteLength(kept, "utf8")
+  }
+  if (kept.length !== data.length) buffer.dropped = true
+}
+
+export function renderExecOutput(buffer: ExecBuffer): string {
+  const body = buffer.chunks.map((chunk) => chunk.data).join("")
+  return buffer.dropped ? `${body}${body.endsWith("\n") || !body ? "" : "\n"}${OUTPUT_CAP_MARKER}` : body
+}
+
+export function outputChunks(buffer: ExecBuffer): ReadonlyArray<OutputChunk> {
+  return buffer.chunks
+}
+
+function appendSshStderr(connection: Connection, chunk: string): void {
+  const joined = connection.sshStderr + chunk
+  connection.sshStderr = takeUtf8Prefix(joined.slice(-SSH_STDERR_MAX_BYTES * 2), SSH_STDERR_MAX_BYTES)
+  if (Buffer.byteLength(joined, "utf8") > SSH_STDERR_MAX_BYTES) {
+    const bytes = Buffer.from(joined, "utf8")
+    connection.sshStderr = bytes.subarray(Math.max(0, bytes.length - SSH_STDERR_MAX_BYTES)).toString("utf8")
+  }
+}
+
+function connectionError(connection: Connection, error: unknown): Error {
+  const message = error instanceof Error ? error.message : String(error)
+  const stderr = connection.sshStderr.trim()
+  return new Error(stderr ? `${message}\nSSH stderr: ${stderr}` : message)
 }
 
 function getExecBuffer(connection: Connection, processID: string): ExecBuffer {
   let buffer = connection.execBuffers.get(processID)
   if (!buffer) {
-    buffer = { stdout: [], stderr: [] }
+    buffer = createExecBuffer()
     connection.execBuffers.set(processID, buffer)
   }
   return buffer
@@ -1297,8 +1676,7 @@ function handleNotification(connection: Connection, method: string, params: any)
     if (!processID) return
     const data = decodeData(String(params?.data ?? ""), String(params?.encoding ?? "utf8"))
     const buffer = getExecBuffer(connection, processID)
-    if (method === "exec.stdout") buffer.stdout.push(data)
-    else buffer.stderr.push(data)
+    appendExecOutput(buffer, method === "exec.stdout" ? "stdout" : "stderr", data)
     return
   }
 
@@ -1319,10 +1697,9 @@ function handleNotification(connection: Connection, method: string, params: any)
     const ptyID = String(params?.pty_id ?? "")
     if (!ptyID) return
     const data = decodeData(String(params?.data ?? ""), String(params?.encoding ?? "utf8"))
-    const chunks = connection.ptyBuffers.get(ptyID) ?? []
-    chunks.push(data)
-    if (chunks.length > 4000) chunks.shift()
-    connection.ptyBuffers.set(ptyID, chunks)
+    const buffer = connection.ptyBuffers.get(ptyID) ?? createExecBuffer()
+    appendExecOutput(buffer, "stdout", data)
+    connection.ptyBuffers.set(ptyID, buffer)
   }
 }
 
@@ -1359,7 +1736,9 @@ async function rpcRequest(
   method: string,
   params: Record<string, unknown>,
   timeoutMs = 30000,
+  signal?: AbortSignal,
 ): Promise<any> {
+  if (signal) throwIfAborted(signal)
   if (!isAlive(connection)) {
     throw new Error(`Connection to target \"${connection.alias}\" is not active`)
   }
@@ -1372,22 +1751,47 @@ async function rpcRequest(
   const payload = JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n"
 
   return await new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
+    let settled = false
+    const cleanup = () => {
+      if (signal) signal.removeEventListener("abort", onAbort)
+    }
+    const fail = (error: Error) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      cleanup()
       connection.pending.delete(id)
-      reject(new Error(`Request \"${method}\" timed out`))
+      reject(error)
+    }
+    const succeed = (value: any) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      cleanup()
+      connection.pending.delete(id)
+      resolve(value)
+    }
+    const onAbort = () => fail(new Error("Operation cancelled"))
+    const timer = setTimeout(() => {
+      fail(new Error(`Request \"${method}\" timed out`))
     }, timeoutMs)
 
     connection.pending.set(id, {
-      resolve: (value) => resolve(value),
-      reject: (err) => reject(err),
+      resolve: succeed,
+      reject: fail,
       timer,
+      cleanup,
     })
 
+    if (signal) {
+      signal.addEventListener("abort", onAbort, { once: true })
+      if (signal.aborted) onAbort()
+    }
+
+    if (settled) return
     connection.proc.stdin!.write(payload, (err) => {
       if (err) {
-        clearTimeout(timer)
-        connection.pending.delete(id)
-        reject(err)
+        fail(err)
       }
     })
   })
@@ -1397,7 +1801,9 @@ async function createConnection(
   opencodeSessionID: string,
   alias: string,
   target: TargetConfig,
+  signal?: AbortSignal,
 ): Promise<Connection> {
+  if (signal) throwIfAborted(signal)
   if (!target.host) {
     throw new Error(`Target \"${alias}\" is missing \"host\"`)
   }
@@ -1426,12 +1832,13 @@ async function createConnection(
     pending: new Map(),
     closed: false,
     remoteSessionID: "",
-    cwd: target.defaultCwd ?? "/",
-    workspaceRoots: target.workspaceRoots ?? [],
+    cwd: configuredRemoteCwd(target),
+    workspaceRoots: configuredWorkspaceRoots(target),
     execBuffers: new Map(),
     execExits: new Map(),
     execExitWaiters: new Map(),
     ptyBuffers: new Map(),
+    sshStderr: "",
   }
   connections.set(key, connection)
 
@@ -1447,6 +1854,10 @@ async function createConnection(
   proc.stdout?.setEncoding("utf8")
   proc.stdout?.on("data", (chunk: string) => {
     connection.buffer += chunk
+    if (Buffer.byteLength(connection.buffer, "utf8") > RPC_LINE_MAX_BYTES) {
+      closeConnection(connection, "REXD RPC response exceeded the safety limit")
+      return
+    }
     let newline = connection.buffer.indexOf("\n")
     while (newline !== -1) {
       const line = connection.buffer.slice(0, newline)
@@ -1456,58 +1867,52 @@ async function createConnection(
     }
   })
 
-  const session = await rpcRequest(
-    connection,
+  proc.stderr?.setEncoding("utf8")
+  proc.stderr?.on("data", (chunk: string) => appendSshStderr(connection, chunk))
+
+  try {
+    const session = await rpcRequest(
+      connection,
       "session.open",
-        {
-          client_name: "opencode-rexd-target",
-          client_version: CLIENT_VERSION,
-          workspace_roots: target.workspaceRoots,
-        },
+      {
+        client_name: "opencode-rexd-target",
+        client_version: CLIENT_VERSION,
+        workspace_roots: target.workspaceRoots,
+      },
       20000,
-  )
+      signal,
+    )
 
-  connection.remoteSessionID = String(session?.session_id ?? "")
-  if (!connection.remoteSessionID) {
-    closeConnection(connection, "session.open did not return session_id")
-    throw new Error("session.open failed: missing session_id")
+    connection.remoteSessionID = String(session?.session_id ?? "")
+    if (!connection.remoteSessionID) {
+      throw new Error("session.open failed: missing session_id")
+    }
+
+    connection.workspaceRoots = Array.isArray(session?.workspace_roots)
+      ? session.workspace_roots.map((root: string) => normalizeRemotePath(root))
+      : configuredWorkspaceRoots(target)
+    connection.cwd = configuredRemoteCwd(target)
+    return connection
+  } catch (error) {
+    const failure = connectionError(connection, error)
+    closeConnection(connection, failure.message)
+    throw failure
   }
-
-  connection.workspaceRoots = Array.isArray(session?.workspace_roots)
-    ? session.workspace_roots.map((root: string) => normalizeRemotePath(root))
-    : target.workspaceRoots ?? []
-  connection.cwd =
-    normalizeRemotePath(target.defaultCwd ?? "") ||
-    connection.workspaceRoots[0] ||
-    "/"
-
-  return connection
 }
 
-async function ensureConnection(opencodeSessionID: string): Promise<Connection> {
-  const state = loadSessionState(opencodeSessionID)
-  if (!state.activeTargetAlias) {
-    throw new Error("No active target. Use /target use <alias> first.")
-  }
-
-  const target = getTarget(state.activeTargetAlias)
-  if (!target) {
-    throw new Error(`Target \"${state.activeTargetAlias}\" is not configured.`)
-  }
-
-  if (target.transport !== "ssh") {
-    throw new Error(`Target \"${state.activeTargetAlias}\" uses unsupported transport \"${target.transport}\".`)
-  }
+async function ensureConnection(opencodeSessionID: string, state = loadSessionState(opencodeSessionID), signal?: AbortSignal): Promise<Connection> {
+  const { alias, target } = configuredActiveTarget(state)
+  if (signal) throwIfAborted(signal)
 
   touchSessionState(opencodeSessionID, state)
 
-  const key = connectionKey(opencodeSessionID, state.activeTargetAlias)
+  const key = connectionKey(opencodeSessionID, alias)
   const existing = connections.get(key)
   if (existing && isAlive(existing)) {
     return existing
   }
 
-  return await createConnection(opencodeSessionID, state.activeTargetAlias, target)
+  return await createConnection(opencodeSessionID, alias, target, signal)
 }
 
 function getPtyNoRemoteTargetMessage(opencodeSessionID: string): string | null {
@@ -1522,41 +1927,103 @@ function disconnectAlias(opencodeSessionID: string, alias: string): void {
   if (connection) closeConnection(connection, "Disconnected")
 }
 
-async function runLocalExec(
+type ExecResult = { output: ExecBuffer; exitCode: number }
+
+function terminateLocalProcess(proc: ReturnType<typeof spawn>): void {
+  const kill = (signal: NodeJS.Signals) => {
+    try {
+      if (process.platform !== "win32" && proc.pid) process.kill(-proc.pid, signal)
+      else proc.kill(signal)
+    } catch {
+      try {
+        proc.kill(signal)
+      } catch {}
+    }
+  }
+  kill("SIGTERM")
+  const forceTimer = setTimeout(() => kill("SIGKILL"), 1000)
+  proc.once("exit", () => clearTimeout(forceTimer))
+}
+
+export async function runLocalExec(
   command: string,
-  options: { cwd: string; timeoutMs?: number },
-): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+  options: { cwd: string; timeoutMs?: number; signal?: AbortSignal },
+): Promise<ExecResult> {
+  if (options.signal) throwIfAborted(options.signal)
   return await new Promise((resolvePromise, rejectPromise) => {
-    const proc = spawn("/bin/bash", ["-lc", command], { cwd: options.cwd })
-    let stdout = ""
-    let stderr = ""
+    const proc = spawn("/bin/bash", ["-lc", command], {
+      cwd: options.cwd,
+      detached: process.platform !== "win32",
+    })
+    const output = createExecBuffer()
     let timedOut = false
+    let settled = false
+
+    const onAbort = () => {
+      terminateLocalProcess(proc)
+      finish(new Error("Operation cancelled"))
+    }
+    const onStdout = (chunk: Buffer) => appendExecOutput(output, "stdout", chunk.toString("utf8"))
+    const onStderr = (chunk: Buffer) => appendExecOutput(output, "stderr", chunk.toString("utf8"))
+    const cleanup = () => {
+      clearTimeout(timer)
+      if (options.signal) options.signal.removeEventListener("abort", onAbort)
+      proc.stdout?.off("data", onStdout)
+      proc.stderr?.off("data", onStderr)
+      proc.off("error", onError)
+      proc.off("exit", onExit)
+    }
+    const finish = (error?: Error, result?: ExecResult) => {
+      if (settled) return
+      settled = true
+      cleanup()
+      if (error) rejectPromise(error)
+      else resolvePromise(result!)
+    }
 
     const timer = setTimeout(() => {
       timedOut = true
-      proc.kill("SIGKILL")
+      terminateLocalProcess(proc)
     }, options.timeoutMs ?? 120000)
 
-    proc.stdout.on("data", (chunk) => {
-      stdout += chunk.toString("utf8")
-    })
-    proc.stderr.on("data", (chunk) => {
-      stderr += chunk.toString("utf8")
-    })
+    proc.stdout?.on("data", onStdout)
+    proc.stderr?.on("data", onStderr)
 
-    proc.on("error", (err) => {
-      clearTimeout(timer)
-      rejectPromise(err)
-    })
+    const onError = (err: Error) => finish(err)
+    const onExit = (code: number | null) => {
+      if (timedOut) appendExecOutput(output, "stderr", "\nCommand timed out")
+      finish(undefined, { output, exitCode: timedOut ? 124 : code ?? 0 })
+    }
+    proc.on("error", onError)
+    proc.on("exit", onExit)
 
-    proc.on("exit", (code) => {
-      clearTimeout(timer)
-      if (timedOut) {
-        resolvePromise({ stdout, stderr: `${stderr}\nCommand timed out`, exitCode: 124 })
-        return
-      }
-      resolvePromise({ stdout, stderr, exitCode: code ?? 0 })
-    })
+    if (options.signal) {
+      options.signal.addEventListener("abort", onAbort, { once: true })
+      if (options.signal.aborted) onAbort()
+    }
+  })
+}
+
+export function waitForAbort<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return promise
+  if (signal.aborted) return Promise.reject(new Error("Operation cancelled"))
+  return new Promise((resolve, reject) => {
+    const onAbort = () => {
+      signal.removeEventListener("abort", onAbort)
+      reject(new Error("Operation cancelled"))
+    }
+    signal.addEventListener("abort", onAbort, { once: true })
+    if (signal.aborted) onAbort()
+    promise.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort)
+        resolve(value)
+      },
+      (error) => {
+        signal.removeEventListener("abort", onAbort)
+        reject(error)
+      },
+    )
   })
 }
 
@@ -1564,7 +2031,9 @@ async function waitForRemoteExit(
   connection: Connection,
   processID: string,
   timeoutMs: number,
+  signal?: AbortSignal,
 ): Promise<any> {
+  if (signal) throwIfAborted(signal)
   const existing = connection.execExits.get(processID)
   if (existing) {
     connection.execExits.delete(processID)
@@ -1572,63 +2041,166 @@ async function waitForRemoteExit(
   }
 
   return await new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
+    let settled = false
+    const cleanup = () => {
+      if (signal) signal.removeEventListener("abort", onAbort)
+    }
+    const fail = (error: Error) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      cleanup()
       connection.execExitWaiters.delete(processID)
-      reject(new Error(`Remote process ${processID} did not exit before timeout`))
+      reject(error)
+    }
+    const succeed = (value: any) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      cleanup()
+      connection.execExitWaiters.delete(processID)
+      resolve(value)
+    }
+    const onAbort = () => fail(new Error("Operation cancelled"))
+    const timer = setTimeout(() => {
+      fail(new Error(`Remote process ${processID} did not exit before timeout`))
     }, timeoutMs)
 
     connection.execExitWaiters.set(processID, {
-      resolve: (value) => resolve(value),
-      reject: (err) => reject(err),
+      resolve: succeed,
+      reject: fail,
       timer,
+      cleanup,
     })
+    if (signal) {
+      signal.addEventListener("abort", onAbort, { once: true })
+      if (signal.aborted) onAbort()
+    }
   })
+}
+
+export async function runRemoteProcessLifecycle<T>(
+  operations: {
+    start: () => Promise<string>
+    wait: (processID: string, signal?: AbortSignal) => Promise<T>
+    kill: (processID: string) => Promise<void>
+    cleanup: (processID: string) => void
+  },
+  signal?: AbortSignal,
+): Promise<{ processID: string; exit: T }> {
+  if (signal) throwIfAborted(signal)
+  const start = operations.start()
+  let processID = ""
+  try {
+    processID = await waitForAbort(start, signal)
+  } catch (error) {
+    if (signal?.aborted) {
+      void start.then(
+        async (id) => {
+          try {
+            await operations.kill(id)
+          } catch {
+          } finally {
+            operations.cleanup(id)
+          }
+        },
+        () => {},
+      )
+    }
+    throw error
+  }
+
+  try {
+    const exit = await operations.wait(processID, signal)
+    return { processID, exit }
+  } catch (error) {
+    try {
+      await operations.kill(processID)
+    } catch {}
+    operations.cleanup(processID)
+    throw error
+  }
+}
+
+async function killRemoteExec(connection: Connection, processID: string): Promise<void> {
+  if (!isAlive(connection)) return
+  await rpcRequest(
+    connection,
+    "exec.kill",
+    { session_id: connection.remoteSessionID, process_id: processID, signal: "KILL" },
+    5000,
+  )
+}
+
+function cleanupRemoteExec(connection: Connection, processID: string): void {
+  const waiter = connection.execExitWaiters.get(processID)
+  if (waiter) {
+    clearTimeout(waiter.timer)
+    waiter.cleanup()
+    connection.execExitWaiters.delete(processID)
+  }
+  connection.execBuffers.delete(processID)
+  connection.execExits.delete(processID)
 }
 
 async function runRemoteExec(
   connection: Connection,
   command: string,
-  options: { cwd?: string; timeoutMs?: number },
-): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+  options: { cwd?: string; timeoutMs?: number; signal?: AbortSignal },
+): Promise<ExecResult> {
+  if (options.signal) throwIfAborted(options.signal)
   const login = connection.target.loginShell === true
-  const start = await rpcRequest(
-    connection,
-    "exec.start",
+  const lifecycle = await runRemoteProcessLifecycle(
     {
-      session_id: connection.remoteSessionID,
-      command,
-      shell: true,
-      ...(login ? { login: true } : {}),
-      cwd: options.cwd ?? connection.cwd,
-      timeout_ms: options.timeoutMs,
+      start: async () => {
+        const start = await rpcRequest(
+          connection,
+          "exec.start",
+          {
+            session_id: connection.remoteSessionID,
+            command,
+            shell: true,
+            ...(login ? { login: true } : {}),
+            cwd: options.cwd ?? connection.cwd,
+            timeout_ms: options.timeoutMs,
+          },
+          20000,
+        )
+        const processID = String(start?.process_id ?? "")
+        if (!processID) throw new Error("exec.start failed: missing process_id")
+        getExecBuffer(connection, processID)
+        return processID
+      },
+      wait: (processID, signal) => waitForRemoteExit(connection, processID, (options.timeoutMs ?? 120000) + 10000, signal),
+      kill: (processID) => killRemoteExec(connection, processID),
+      cleanup: (processID) => cleanupRemoteExec(connection, processID),
     },
-    20000,
+    options.signal,
   )
 
-  const processID = String(start?.process_id ?? "")
-  if (!processID) throw new Error("exec.start failed: missing process_id")
-
-  getExecBuffer(connection, processID)
-
-  const exit = await waitForRemoteExit(connection, processID, (options.timeoutMs ?? 120000) + 10000)
-
-  const output = connection.execBuffers.get(processID) ?? { stdout: [], stderr: [] }
-  connection.execBuffers.delete(processID)
-  connection.execExits.delete(processID)
-  return {
-    stdout: output.stdout.join(""),
-    stderr: output.stderr.join(""),
-    exitCode: Number(exit?.exit_code ?? 0),
+  try {
+    return {
+      output: connection.execBuffers.get(lifecycle.processID) ?? createExecBuffer(),
+      exitCode: Number(lifecycle.exit?.exit_code ?? 0),
+    }
+  } finally {
+    cleanupRemoteExec(connection, lifecycle.processID)
   }
 }
 
-function renderExecResult(stdout: string, stderr: string, exitCode: number): string {
-  const cleanedStdout = stdout.trimEnd()
-  const cleanedStderr = stderr.trimEnd()
-  const body = [cleanedStdout, cleanedStderr].filter(Boolean).join("\n")
-  if (body && exitCode === 0) return body
-  if (body) return `${body}\n[exit code: ${exitCode}]`
-  return exitCode === 0 ? "(no output)" : `[exit code: ${exitCode}]`
+function renderExecResult(result: ExecResult): string {
+  const body = renderExecOutput(result.output).trimEnd()
+  if (body && result.exitCode === 0) return body
+  if (body) return `${body}\n[exit code: ${result.exitCode}]`
+  return result.exitCode === 0 ? "(no output)" : `[exit code: ${result.exitCode}]`
+}
+
+export function resolveBashTimeout(input: { timeout?: number; timeout_ms?: number }): number | undefined {
+  const timeout = input.timeout ?? input.timeout_ms
+  if (timeout !== undefined && (!Number.isFinite(timeout) || timeout < 0)) {
+    throw new Error("Invalid timeout value: timeout must be a non-negative number of milliseconds.")
+  }
+  return timeout
 }
 
 async function handleTargetSubcommand(opencodeSessionID: string, subcommand: string, alias?: string): Promise<string> {
@@ -1730,24 +2302,6 @@ export const RexdTargetPlugin: Plugin = async () => {
       setCommandText(output, message)
     },
 
-    "tool.execute.after": async (input, output) => {
-      const staged = consumeUiState(input.tool, input.sessionID, input.callID)
-      if (staged) {
-        if (staged.title) output.title = staged.title
-        if (staged.output) output.output = staged.output
-        output.metadata = { ...(output.metadata ?? {}), ...(staged.metadata ?? {}) }
-      }
-
-      if (input.tool === "bash" && typeof output.output === "string") {
-        const metadata = (output.metadata ?? {}) as Record<string, any>
-        output.metadata = {
-          ...metadata,
-          output: output.output,
-          description: typeof metadata.description === "string" ? metadata.description : "Shell",
-        }
-      }
-    },
-
     tool: {
       target: tool({
         description: "Manage REXD targets: list/use/status/clear",
@@ -1765,27 +2319,43 @@ export const RexdTargetPlugin: Plugin = async () => {
         args: {
           command: tool.schema.string().describe("Shell command"),
           description: tool.schema.string().optional().describe("Command description"),
-          timeout_ms: tool.schema.number().optional().describe("Timeout in milliseconds"),
+          timeout: tool.schema.number().optional().describe("Timeout in milliseconds"),
+          timeout_ms: tool.schema.number().optional().describe("Deprecated alias for timeout; timeout takes precedence"),
           workdir: tool.schema.string().optional().describe("Working directory"),
         },
         async execute(args, context: ToolContext) {
           const state = loadSessionState(context.sessionID)
-          if (!state.activeTargetAlias) {
-            const cwd = args.workdir ? localPath(context.directory, args.workdir) : context.directory
-            const result = await runLocalExec(args.command, { cwd, timeoutMs: args.timeout_ms })
-            return renderExecResult(result.stdout, result.stderr, result.exitCode)
-          }
-
-          const connection = await ensureConnection(context.sessionID)
-          const remoteCwd = args.workdir ? remotePath(connection.cwd, args.workdir) : connection.cwd
-          const guardError = guardRemotePath(connection.target, remoteCwd, connection.workspaceRoots)
-          if (guardError) return guardError
-
-          const result = await runRemoteExec(connection, args.command, {
-            cwd: remoteCwd,
-            timeoutMs: args.timeout_ms,
+          const timeoutMs = resolveBashTimeout(args)
+          return await executeForSessionState(state, {
+            local: async () => {
+              const cwd = args.workdir ? localPath(context.directory, args.workdir) : context.directory
+              await askBashPermission(context, args.command, cwd)
+              const result = await runLocalExec(args.command, { cwd, timeoutMs, signal: context.abort })
+              const output = renderExecResult(result)
+              return { title: args.command, output, metadata: { output, description: args.description ?? "Shell" } }
+            },
+            remote: async () => {
+              const { alias, target } = configuredActiveTarget(state)
+              assertTargetCapabilities(alias, target, ["shell"])
+              const remoteCwd = args.workdir
+                ? remotePath(configuredRemoteCwd(target), args.workdir)
+                : configuredRemoteCwd(target)
+              const guardError = guardRemotePath(target, remoteCwd, configuredWorkspaceRoots(target))
+              if (guardError) throw new Error(guardError)
+              await askBashPermission(context, args.command, remoteCwd, {
+                target: alias,
+                workspaceRoots: configuredWorkspaceRoots(target),
+              })
+              const connection = await ensureConnection(context.sessionID, state, context.abort)
+              const result = await runRemoteExec(connection, args.command, {
+                cwd: remoteCwd,
+                timeoutMs,
+                signal: context.abort,
+              })
+              const output = renderExecResult(result)
+              return { title: args.command, output, metadata: { output, description: args.description ?? "Shell" } }
+            },
           })
-          return renderExecResult(result.stdout, result.stderr, result.exitCode)
         },
       }),
 
@@ -1798,17 +2368,28 @@ export const RexdTargetPlugin: Plugin = async () => {
         },
         async execute(args, context: ToolContext) {
           const state = loadSessionState(context.sessionID)
-          if (!state.activeTargetAlias) {
-            const path = localPath(context.directory, args.filePath)
-            return readLocalResolvedPath(path, args) as any
-          }
-
-          const connection = await ensureConnection(context.sessionID)
-          const path = remotePath(connection.cwd, args.filePath)
-          const guardError = guardRemotePath(connection.target, path, connection.workspaceRoots)
-          if (guardError) return guardError
-
-          return (await readRemoteResolvedPath(connection, path, args)) as any
+          return await executeForSessionState(state, {
+            local: async () => {
+              const path = localPath(context.directory, args.filePath)
+              await askLocalPathPermission(context, "read", path)
+              return readLocalResolvedPath(path, args) as ToolResult
+            },
+            remote: async () => {
+              const { alias, target } = configuredActiveTarget(state)
+              assertTargetCapabilities(alias, target, ["fs"])
+              const path = remotePath(configuredRemoteCwd(target), args.filePath)
+              const guardError = guardRemotePath(target, path, configuredWorkspaceRoots(target))
+              if (guardError) throw new Error(guardError)
+              await askRemotePathPermission(context, {
+                permission: "read",
+                path,
+                workspaceRoots: configuredWorkspaceRoots(target),
+                target: alias,
+              })
+              const connection = await ensureConnection(context.sessionID, state, context.abort)
+              return (await readRemoteResolvedPath(connection, path, args, context.abort)) as ToolResult
+            },
+          })
         },
       }),
 
@@ -1820,28 +2401,45 @@ export const RexdTargetPlugin: Plugin = async () => {
         },
         async execute(args, context: ToolContext) {
           const state = loadSessionState(context.sessionID)
-          if (!state.activeTargetAlias) {
-            const path = localPath(context.directory, args.filePath)
-            const dir = dirname(path)
-            if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
-            writeFileSync(path, args.content)
-            return `Wrote ${args.filePath}`
-          }
-
-          const connection = await ensureConnection(context.sessionID)
-          const path = remotePath(connection.cwd, args.filePath)
-          const guardError = guardRemotePath(connection.target, path, connection.workspaceRoots)
-          if (guardError) return guardError
-
-          await rpcRequest(connection, "fs.write", {
-            session_id: connection.remoteSessionID,
-            path,
-            content: args.content,
-            mode: "replace",
-            mkdir_parents: true,
-            atomic: true,
+          return await executeForSessionState(state, {
+            local: async () => {
+              const path = localPath(context.directory, args.filePath)
+              await askLocalPathPermission(context, "edit", path)
+              const dir = dirname(path)
+              if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
+              writeFileSync(path, args.content)
+              return `Wrote ${args.filePath}`
+            },
+            remote: async () => {
+              const { alias, target } = configuredActiveTarget(state)
+              assertTargetCapabilities(alias, target, ["fs"])
+              const path = remotePath(configuredRemoteCwd(target), args.filePath)
+              const guardError = guardRemotePath(target, path, configuredWorkspaceRoots(target))
+              if (guardError) throw new Error(guardError)
+              await askRemotePathPermission(context, {
+                permission: "edit",
+                path,
+                workspaceRoots: configuredWorkspaceRoots(target),
+                target: alias,
+              })
+              const connection = await ensureConnection(context.sessionID, state, context.abort)
+              await rpcRequest(
+                connection,
+                "fs.write",
+                {
+                  session_id: connection.remoteSessionID,
+                  path,
+                  content: args.content,
+                  mode: "replace",
+                  mkdir_parents: true,
+                  atomic: true,
+                },
+                30000,
+                context.abort,
+              )
+              return `Wrote ${args.filePath}`
+            },
           })
-          return `Wrote ${args.filePath}`
         },
       }),
 
@@ -1855,60 +2453,68 @@ export const RexdTargetPlugin: Plugin = async () => {
         },
         async execute(args, context: ToolContext) {
           const state = loadSessionState(context.sessionID)
-          if (!state.activeTargetAlias) {
-            const path = localPath(context.directory, args.filePath)
-            const existed = existsSync(path)
-            const current = existed ? readFileSync(path, "utf-8") : ""
-
-            if (!existed && args.oldString !== "") {
-              throw new Error(`File does not exist: ${path}`)
-            }
-
-            const edited = applyExactEdit(current, args.oldString, args.newString, args.replaceAll ?? false)
-            const dir = dirname(path)
-            if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
-            writeFileSync(path, edited.content)
-            stageUiState("edit", context, {
-              title: relativeUiPathFromWorktree(context.worktree, path, args.filePath),
-              metadata: buildEditUiMetadata(path, current, edited.content),
-            })
-            return `Edited ${args.filePath} (${edited.replacements} replacement${edited.replacements === 1 ? "" : "s"})`
-          }
-
-          const connection = await ensureConnection(context.sessionID)
-          const path = remotePath(connection.cwd, args.filePath)
-          const guardError = guardRemotePath(connection.target, path, connection.workspaceRoots)
-          if (guardError) return guardError
-
-          let editMetadata: ReturnType<typeof buildEditUiMetadata> | undefined
-          try {
-            let current = ""
-            try {
-              current = await readRemoteFile(connection, path)
-            } catch {
-              current = ""
-            }
-            const edited = applyExactEdit(current, args.oldString, args.newString, args.replaceAll ?? false)
-            editMetadata = buildEditUiMetadata(path, current, edited.content)
-          } catch {}
-
-          const response = await rpcRequest(connection, "fs.edit", {
-            session_id: connection.remoteSessionID,
-            path,
-            old_string: args.oldString,
-            new_string: args.newString,
-            replace_all: args.replaceAll ?? false,
+          return await executeForSessionState(state, {
+            local: async () => {
+              const path = localPath(context.directory, args.filePath)
+              await askLocalPathPermission(context, "edit", path)
+              const existed = existsSync(path)
+              const current = existed ? readFileSync(path, "utf-8") : ""
+              if (!existed && args.oldString !== "") throw new Error(`File does not exist: ${path}`)
+              const edited = applyExactEdit(current, args.oldString, args.newString, args.replaceAll ?? false)
+              const dir = dirname(path)
+              if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
+              writeFileSync(path, edited.content)
+              return {
+                title: relativeUiPathFromWorktree(context.worktree, path, args.filePath),
+                output: `Edited ${args.filePath} (${edited.replacements} replacement${edited.replacements === 1 ? "" : "s"})`,
+                metadata: buildEditUiMetadata(path, current, edited.content),
+              }
+            },
+            remote: async () => {
+              const { alias, target } = configuredActiveTarget(state)
+              assertTargetCapabilities(alias, target, ["fs"])
+              const path = remotePath(configuredRemoteCwd(target), args.filePath)
+              const guardError = guardRemotePath(target, path, configuredWorkspaceRoots(target))
+              if (guardError) throw new Error(guardError)
+              await askRemotePathPermission(context, {
+                permission: "edit",
+                path,
+                workspaceRoots: configuredWorkspaceRoots(target),
+                target: alias,
+              })
+              const connection = await ensureConnection(context.sessionID, state, context.abort)
+              let editMetadata: ReturnType<typeof buildEditUiMetadata> | undefined
+              try {
+                let current = ""
+                try {
+                  current = await readRemoteFile(connection, path, context.abort)
+                } catch {
+                  current = ""
+                }
+                const edited = applyExactEdit(current, args.oldString, args.newString, args.replaceAll ?? false)
+                editMetadata = buildEditUiMetadata(path, current, edited.content)
+              } catch {}
+              const response = await rpcRequest(
+                connection,
+                "fs.edit",
+                {
+                  session_id: connection.remoteSessionID,
+                  path,
+                  old_string: args.oldString,
+                  new_string: args.newString,
+                  replace_all: args.replaceAll ?? false,
+                },
+                30000,
+                context.abort,
+              )
+              const replacements = Number(response?.replacements ?? 0)
+              return {
+                title: relativeUiPathFromCwd(connection.cwd, path, args.filePath),
+                output: `Edited ${args.filePath} (${replacements} replacement${replacements === 1 ? "" : "s"})`,
+                metadata: editMetadata,
+              }
+            },
           })
-
-          if (editMetadata) {
-            stageUiState("edit", context, {
-              title: relativeUiPathFromCwd(connection.cwd, path, args.filePath),
-              metadata: editMetadata,
-            })
-          }
-
-          const replacements = Number(response?.replacements ?? 0)
-          return `Edited ${args.filePath} (${replacements} replacement${replacements === 1 ? "" : "s"})`
         },
       }),
 
@@ -1919,53 +2525,67 @@ export const RexdTargetPlugin: Plugin = async () => {
         },
         async execute(args, context: ToolContext) {
           const state = loadSessionState(context.sessionID)
-          if (!state.activeTargetAlias) {
-            let files: PatchUiFile[] | undefined
-            try {
-              files = buildLocalPatchUiFiles(context.directory, args.patchText, context.worktree)
-            } catch {}
-
-            const summary = applyLocalPatch(context.directory, args.patchText)
-            if (files) {
-              stageUiState("apply_patch", context, {
-                metadata: {
-                  files,
-                  diff: files.map((file) => file.patch).join("\n"),
-                },
-              })
-            }
-            return renderPatchSummary(summary)
-          }
-
-          const connection = await ensureConnection(context.sessionID)
-          const guardError = guardRemotePatch(
-            connection.target,
-            connection.cwd,
-            connection.workspaceRoots,
-            args.patchText,
-          )
-          if (guardError) return guardError
-
-          let files: PatchUiFile[] | undefined
-          try {
-            files = await buildRemotePatchUiFiles(connection, args.patchText)
-          } catch {}
-
-          const response = await rpcRequest(connection, "fs.patch", {
-            session_id: connection.remoteSessionID,
-            patch_text: args.patchText,
-            cwd: connection.cwd,
+          return await executeForSessionState(state, {
+            local: async () => {
+              const hunks = parsePatchEnvelope(args.patchText)
+              for (const hunk of hunks) {
+                await askLocalPathPermission(context, "edit", localPath(context.directory, hunk.path))
+                if (hunk.type === "update" && hunk.movePath) {
+                  await askLocalPathPermission(context, "edit", localPath(context.directory, hunk.movePath))
+                }
+              }
+              let files: PatchUiFile[] | undefined
+              try {
+                files = buildLocalPatchUiFiles(context.directory, args.patchText, context.worktree)
+              } catch {}
+              const summary = applyLocalPatch(context.directory, args.patchText)
+              return {
+                output: renderPatchSummary(summary),
+                metadata: files ? { files, diff: files.map((file) => file.patch).join("\n") } : undefined,
+              }
+            },
+            remote: async () => {
+              const { alias, target } = configuredActiveTarget(state)
+              assertTargetCapabilities(alias, target, ["fs"])
+              const cwd = configuredRemoteCwd(target)
+              const roots = configuredWorkspaceRoots(target)
+              const guardError = guardRemotePatch(target, cwd, roots, args.patchText)
+              if (guardError) throw new Error(guardError)
+              const hunks = parsePatchEnvelope(args.patchText)
+              for (const hunk of hunks) {
+                await askRemotePathPermission(context, {
+                  permission: "edit",
+                  path: remotePath(cwd, hunk.path),
+                  workspaceRoots: roots,
+                  target: alias,
+                })
+                if (hunk.type === "update" && hunk.movePath) {
+                  await askRemotePathPermission(context, {
+                    permission: "edit",
+                    path: remotePath(cwd, hunk.movePath),
+                    workspaceRoots: roots,
+                    target: alias,
+                  })
+                }
+              }
+              const connection = await ensureConnection(context.sessionID, state, context.abort)
+              let files: PatchUiFile[] | undefined
+              try {
+                files = await buildRemotePatchUiFiles(connection, args.patchText, context.abort)
+              } catch {}
+              const response = await rpcRequest(
+                connection,
+                "fs.patch",
+                { session_id: connection.remoteSessionID, patch_text: args.patchText, cwd },
+                30000,
+                context.abort,
+              )
+              return {
+                output: renderPatchSummary(normalizePatchSummary(response)),
+                metadata: files ? { files, diff: files.map((file) => file.patch).join("\n") } : undefined,
+              }
+            },
           })
-
-          if (files) {
-            stageUiState("apply_patch", context, {
-              metadata: {
-                files,
-                diff: files.map((file) => file.patch).join("\n"),
-              },
-            })
-          }
-          return renderPatchSummary(normalizePatchSummary(response))
         },
       }),
 
@@ -1976,33 +2596,45 @@ export const RexdTargetPlugin: Plugin = async () => {
         },
         async execute(args, context: ToolContext) {
           const state = loadSessionState(context.sessionID)
-          if (!state.activeTargetAlias) {
-            const path = localPath(context.directory, args.filePath ?? ".")
-            const entries = readdirSync(path, { withFileTypes: true })
-              .map((entry) => ({
-                name: entry.name,
-                type: entry.isDirectory() ? "dir" : "file",
-              }))
-              .sort((a, b) => a.name.localeCompare(b.name))
-            return formatListEntries(entries)
-          }
-
-          const connection = await ensureConnection(context.sessionID)
-          const path = remotePath(connection.cwd, args.filePath ?? ".")
-          const guardError = guardRemotePath(connection.target, path, connection.workspaceRoots)
-          if (guardError) return guardError
-
-          const response = await rpcRequest(connection, "fs.list", {
-            session_id: connection.remoteSessionID,
-            path,
+          return await executeForSessionState(state, {
+            local: async () => {
+              const path = localPath(context.directory, args.filePath ?? ".")
+              await askLocalPathPermission(context, "read", path, {}, "directory")
+              const entries = readdirSync(path, { withFileTypes: true })
+                .map((entry) => ({ name: entry.name, type: entry.isDirectory() ? "dir" : "file" }))
+                .sort((a, b) => a.name.localeCompare(b.name))
+              return formatListEntries(entries)
+            },
+            remote: async () => {
+              const { alias, target } = configuredActiveTarget(state)
+              assertTargetCapabilities(alias, target, ["fs"])
+              const path = remotePath(configuredRemoteCwd(target), args.filePath ?? ".")
+              const guardError = guardRemotePath(target, path, configuredWorkspaceRoots(target))
+              if (guardError) throw new Error(guardError)
+              await askRemotePathPermission(context, {
+                permission: "read",
+                path,
+                workspaceRoots: configuredWorkspaceRoots(target),
+                target: alias,
+                kind: "directory",
+              })
+              const connection = await ensureConnection(context.sessionID, state, context.abort)
+              const response = await rpcRequest(
+                connection,
+                "fs.list",
+                { session_id: connection.remoteSessionID, path },
+                30000,
+                context.abort,
+              )
+              const entries = Array.isArray(response?.entries)
+                ? response.entries.map((entry: any) => ({
+                    name: String(entry?.name ?? ""),
+                    type: String(entry?.type ?? "file"),
+                  }))
+                : []
+              return formatListEntries(entries)
+            },
           })
-          const entries = Array.isArray(response?.entries)
-            ? response.entries.map((entry: any) => ({
-                name: String(entry?.name ?? ""),
-                type: String(entry?.type ?? "file"),
-              }))
-            : []
-          return formatListEntries(entries)
         },
       }),
 
@@ -2014,38 +2646,50 @@ export const RexdTargetPlugin: Plugin = async () => {
         },
         async execute(args, context: ToolContext) {
           const state = loadSessionState(context.sessionID)
-          if (!state.activeTargetAlias) {
-            const cwd = localPath(context.directory, args.path ?? ".")
-            const bunGlobal = (globalThis as any).Bun
-            if (bunGlobal?.Glob) {
-              const glob = new bunGlobal.Glob(args.pattern)
-              const matches: string[] = []
-              for await (const file of glob.scan({ cwd })) {
-                matches.push(String(file))
+          return await executeForSessionState(state, {
+            local: async () => {
+              const cwd = localPath(context.directory, args.path ?? ".")
+              await askLocalSearchPermission(context, "glob", args.pattern, cwd, { pattern: args.pattern, path: cwd })
+              const bunGlobal = (globalThis as any).Bun
+              if (bunGlobal?.Glob) {
+                const glob = new bunGlobal.Glob(args.pattern)
+                const matches: string[] = []
+                for await (const file of glob.scan({ cwd })) matches.push(String(file))
+                return matches.join("\n")
               }
+              const command = `cd ${shellQuote(cwd)} && rg --files -g ${shellQuote(args.pattern)}`
+              const result = await runLocalExec(command, { cwd, signal: context.abort })
+              const output = renderExecOutput(result.output)
+              return result.exitCode !== 0 && !output.trim() ? "" : output.trimEnd()
+            },
+            remote: async () => {
+              const { alias, target } = configuredActiveTarget(state)
+              assertTargetCapabilities(alias, target, ["fs"])
+              const cwd = remotePath(configuredRemoteCwd(target), args.path ?? ".")
+              const guardError = guardRemotePath(target, cwd, configuredWorkspaceRoots(target))
+              if (guardError) throw new Error(guardError)
+              await askRemoteSearchPermission(context, {
+                permission: "glob",
+                query: args.pattern,
+                path: cwd,
+                workspaceRoots: configuredWorkspaceRoots(target),
+                target: alias,
+                metadata: { pattern: args.pattern },
+              })
+              const connection = await ensureConnection(context.sessionID, state, context.abort)
+              const response = await rpcRequest(
+                connection,
+                "fs.glob",
+                { session_id: connection.remoteSessionID, pattern: args.pattern, cwd },
+                30000,
+                context.abort,
+              )
+              const matches = Array.isArray(response?.matches)
+                ? response.matches.map((value: unknown) => String(value))
+                : []
               return matches.join("\n")
-            }
-
-            const command = `cd ${shellQuote(cwd)} && rg --files -g ${shellQuote(args.pattern)}`
-            const result = await runLocalExec(command, { cwd })
-            if (result.exitCode !== 0 && !result.stdout.trim()) return ""
-            return result.stdout.trimEnd()
-          }
-
-          const connection = await ensureConnection(context.sessionID)
-          const cwd = remotePath(connection.cwd, args.path ?? ".")
-          const guardError = guardRemotePath(connection.target, cwd, connection.workspaceRoots)
-          if (guardError) return guardError
-
-          const response = await rpcRequest(connection, "fs.glob", {
-            session_id: connection.remoteSessionID,
-            pattern: args.pattern,
-            cwd,
+            },
           })
-          const matches = Array.isArray(response?.matches)
-            ? response.matches.map((value: unknown) => String(value))
-            : []
-          return matches.join("\n")
         },
       }),
 
@@ -2058,26 +2702,42 @@ export const RexdTargetPlugin: Plugin = async () => {
         },
         async execute(args, context: ToolContext) {
           const state = loadSessionState(context.sessionID)
-          if (!state.activeTargetAlias) {
-            const searchPath = localPath(context.directory, args.path ?? ".")
-            let command = `rg -n --color=never ${shellQuote(args.pattern)}`
-            if (args.include) command += ` --glob ${shellQuote(args.include)}`
-            command += ` ${shellQuote(searchPath)}`
-            const result = await runLocalExec(command, { cwd: context.directory })
-            return renderExecResult(result.stdout, result.stderr, result.exitCode)
-          }
-
-          const connection = await ensureConnection(context.sessionID)
-          const searchPath = remotePath(connection.cwd, args.path ?? ".")
-          const guardError = guardRemotePath(connection.target, searchPath, connection.workspaceRoots)
-          if (guardError) return guardError
-
-          let command = `rg -n --color=never ${shellQuote(args.pattern)}`
-          if (args.include) command += ` --glob ${shellQuote(args.include)}`
-          command += ` ${shellQuote(searchPath)}`
-
-          const result = await runRemoteExec(connection, command, { cwd: connection.cwd })
-          return renderExecResult(result.stdout, result.stderr, result.exitCode)
+          return await executeForSessionState(state, {
+            local: async () => {
+              const searchPath = localPath(context.directory, args.path ?? ".")
+              await askLocalSearchPermission(context, "grep", args.pattern, searchPath, {
+                pattern: args.pattern,
+                include: args.include,
+                path: searchPath,
+              })
+              let command = `rg -n --color=never ${shellQuote(args.pattern)}`
+              if (args.include) command += ` --glob ${shellQuote(args.include)}`
+              command += ` ${shellQuote(searchPath)}`
+              return renderExecResult(await runLocalExec(command, { cwd: context.directory, signal: context.abort }))
+            },
+            remote: async () => {
+              const { alias, target } = configuredActiveTarget(state)
+              assertTargetCapabilities(alias, target, ["fs", "shell"])
+              const searchPath = remotePath(configuredRemoteCwd(target), args.path ?? ".")
+              const guardError = guardRemotePath(target, searchPath, configuredWorkspaceRoots(target))
+              if (guardError) throw new Error(guardError)
+              await askRemoteSearchPermission(context, {
+                permission: "grep",
+                query: args.pattern,
+                path: searchPath,
+                workspaceRoots: configuredWorkspaceRoots(target),
+                target: alias,
+                metadata: { pattern: args.pattern, include: args.include },
+              })
+              const connection = await ensureConnection(context.sessionID, state, context.abort)
+              let command = `rg -n --color=never ${shellQuote(args.pattern)}`
+              if (args.include) command += ` --glob ${shellQuote(args.include)}`
+              command += ` ${shellQuote(searchPath)}`
+              return renderExecResult(
+                await runRemoteExec(connection, command, { cwd: configuredRemoteCwd(target), signal: context.abort }),
+              )
+            },
+          })
         },
       }),
 
@@ -2089,26 +2749,48 @@ export const RexdTargetPlugin: Plugin = async () => {
           rows: tool.schema.number().optional().describe("Terminal rows"),
         },
         async execute(args, context: ToolContext) {
-          const noRemoteMessage = getPtyNoRemoteTargetMessage(context.sessionID)
-          if (noRemoteMessage) return noRemoteMessage
-
-          const connection = await ensureConnection(context.sessionID)
-          if (connection.target.capabilities?.pty === false) {
-            return `Target \"${connection.alias}\" does not support PTY.`
-          }
-
-          const response = await rpcRequest(connection, "pty.open", {
-            session_id: connection.remoteSessionID,
-            command: args.command ?? "bash",
-            shell: true,
-            cwd: connection.cwd,
-            cols: args.cols ?? 120,
-            rows: args.rows ?? 36,
+          const state = loadSessionState(context.sessionID)
+          if (!state.activeTargetAlias) return getPtyNoRemoteTargetMessage(context.sessionID)!
+          const { alias, target } = configuredActiveTarget(state)
+          assertTargetCapabilities(alias, target, ["pty", "shell"])
+          const cwd = configuredRemoteCwd(target)
+          await askBashPermission(context, args.command ?? "bash", cwd, {
+            target: alias,
+            workspaceRoots: configuredWorkspaceRoots(target),
           })
-
+          const connection = await ensureConnection(context.sessionID, state, context.abort)
+          const open = rpcRequest(
+            connection,
+            "pty.open",
+            {
+              session_id: connection.remoteSessionID,
+              command: args.command ?? "bash",
+              shell: true,
+              cwd,
+              cols: args.cols ?? 120,
+              rows: args.rows ?? 36,
+            },
+            30000,
+          )
+          let response: any
+          try {
+            response = await waitForAbort(open, context.abort)
+          } catch (error) {
+            if (context.abort.aborted) {
+              void open.then(async (result) => {
+                const ptyID = String(result?.pty_id ?? "")
+                if (ptyID) {
+                  try {
+                    await rpcRequest(connection, "pty.close", { session_id: connection.remoteSessionID, pty_id: ptyID }, 5000)
+                  } catch {}
+                }
+              })
+            }
+            throw error
+          }
           const ptyID = String(response?.pty_id ?? "")
           if (!ptyID) return "Failed to open PTY"
-          connection.ptyBuffers.set(ptyID, [])
+          connection.ptyBuffers.set(ptyID, createExecBuffer())
           return `PTY opened: ${ptyID}`
         },
       }),
@@ -2120,15 +2802,22 @@ export const RexdTargetPlugin: Plugin = async () => {
           data: tool.schema.string().describe("Input data"),
         },
         async execute(args, context: ToolContext) {
-          const noRemoteMessage = getPtyNoRemoteTargetMessage(context.sessionID)
-          if (noRemoteMessage) return noRemoteMessage
-
-          const connection = await ensureConnection(context.sessionID)
-          await rpcRequest(connection, "pty.input", {
-            session_id: connection.remoteSessionID,
-            pty_id: args.id,
-            data: args.data,
+          const state = loadSessionState(context.sessionID)
+          if (!state.activeTargetAlias) return getPtyNoRemoteTargetMessage(context.sessionID)!
+          const { alias, target } = configuredActiveTarget(state)
+          assertTargetCapabilities(alias, target, ["pty", "shell"])
+          await askBashPermission(context, args.data, configuredRemoteCwd(target), {
+            target: alias,
+            workspaceRoots: configuredWorkspaceRoots(target),
           })
+          const connection = await ensureConnection(context.sessionID, state, context.abort)
+          await rpcRequest(
+            connection,
+            "pty.input",
+            { session_id: connection.remoteSessionID, pty_id: args.id, data: args.data },
+            30000,
+            context.abort,
+          )
           return "ok"
         },
       }),
@@ -2140,13 +2829,14 @@ export const RexdTargetPlugin: Plugin = async () => {
           limit: tool.schema.number().optional().describe("Number of chunks to read"),
         },
         async execute(args, context: ToolContext) {
-          const noRemoteMessage = getPtyNoRemoteTargetMessage(context.sessionID)
-          if (noRemoteMessage) return noRemoteMessage
-
-          const connection = await ensureConnection(context.sessionID)
-          const chunks = connection.ptyBuffers.get(args.id) ?? []
-          if (!args.limit || args.limit <= 0) return chunks.join("")
-          return chunks.slice(-args.limit).join("")
+          const state = loadSessionState(context.sessionID)
+          if (!state.activeTargetAlias) return getPtyNoRemoteTargetMessage(context.sessionID)!
+          const { alias, target } = configuredActiveTarget(state)
+          assertTargetCapabilities(alias, target, ["pty"])
+          const connection = await ensureConnection(context.sessionID, state, context.abort)
+          const buffer = connection.ptyBuffers.get(args.id) ?? createExecBuffer()
+          if (!args.limit || args.limit <= 0) return renderExecOutput(buffer)
+          return buffer.chunks.slice(-args.limit).map((chunk) => chunk.data).join("")
         },
       }),
 
@@ -2154,10 +2844,11 @@ export const RexdTargetPlugin: Plugin = async () => {
         description: "List known PTY sessions",
         args: {},
         async execute(_, context: ToolContext) {
-          const noRemoteMessage = getPtyNoRemoteTargetMessage(context.sessionID)
-          if (noRemoteMessage) return noRemoteMessage
-
-          const connection = await ensureConnection(context.sessionID)
+          const state = loadSessionState(context.sessionID)
+          if (!state.activeTargetAlias) return getPtyNoRemoteTargetMessage(context.sessionID)!
+          const { alias, target } = configuredActiveTarget(state)
+          assertTargetCapabilities(alias, target, ["pty"])
+          const connection = await ensureConnection(context.sessionID, state, context.abort)
           const ids = [...connection.ptyBuffers.keys()]
           return ids.length > 0 ? ids.join("\n") : "No active PTY sessions"
         },
@@ -2169,14 +2860,18 @@ export const RexdTargetPlugin: Plugin = async () => {
           id: tool.schema.string().describe("PTY id"),
         },
         async execute(args, context: ToolContext) {
-          const noRemoteMessage = getPtyNoRemoteTargetMessage(context.sessionID)
-          if (noRemoteMessage) return noRemoteMessage
-
-          const connection = await ensureConnection(context.sessionID)
-          await rpcRequest(connection, "pty.close", {
-            session_id: connection.remoteSessionID,
-            pty_id: args.id,
-          })
+          const state = loadSessionState(context.sessionID)
+          if (!state.activeTargetAlias) return getPtyNoRemoteTargetMessage(context.sessionID)!
+          const { alias, target } = configuredActiveTarget(state)
+          assertTargetCapabilities(alias, target, ["pty"])
+          const connection = await ensureConnection(context.sessionID, state, context.abort)
+          await rpcRequest(
+            connection,
+            "pty.close",
+            { session_id: connection.remoteSessionID, pty_id: args.id },
+            30000,
+            context.abort,
+          )
           connection.ptyBuffers.delete(args.id)
           return "PTY closed"
         },

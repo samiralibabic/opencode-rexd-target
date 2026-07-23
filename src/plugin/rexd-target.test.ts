@@ -1,16 +1,33 @@
 import { afterEach, describe, expect, test } from "bun:test"
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs"
+import { existsSync, mkdtempSync, mkdirSync, readdirSync, rmSync, utimesSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { dirname, join } from "node:path"
 import {
   buildRemoteReadRpcParams,
+  createExecBuffer,
+  executeForSessionState,
   formatReadOutput,
   isBinaryReadFile,
+  loadSessionStateFromPath,
+  outputChunks,
   readLocalResolvedPath,
+  renderExecOutput,
+  resolveBashTimeout,
+  RexdTargetPlugin,
+  runLocalExec,
+  runRemoteProcessLifecycle,
+  saveSessionStateToPath,
+  sessionStatePath,
   sniffReadMime,
+  assertTargetCapabilities,
+  askBashPermission,
+  askLocalPathPermission,
+  askRemotePathPermission,
+  appendExecOutput,
 } from "./rexd-target"
 
 const tempDirs: string[] = []
+const stateFiles: string[] = []
 
 function tempDir(): string {
   const dir = mkdtempSync(join(tmpdir(), "opencode-rexd-target-"))
@@ -21,6 +38,9 @@ function tempDir(): string {
 afterEach(() => {
   for (const dir of tempDirs.splice(0)) {
     rmSync(dir, { recursive: true, force: true })
+  }
+  for (const path of stateFiles.splice(0)) {
+    rmSync(path, { force: true })
   }
 })
 
@@ -111,5 +131,325 @@ describe("read helpers", () => {
       encoding: "base64",
       length: 4096,
     })
+  })
+})
+
+function mockContext(directory: string, worktree = directory) {
+  const asks: any[] = []
+  return {
+    asks,
+    context: {
+      sessionID: `test-${Math.random()}`,
+      messageID: "message",
+      agent: "test",
+      directory,
+      worktree,
+      abort: new AbortController().signal,
+      metadata() {},
+      async ask(input: any) {
+        asks.push(input)
+      },
+    },
+  }
+}
+
+describe("permissions and capabilities", () => {
+  test("asks external_directory before a local path permission outside the worktree", async () => {
+    const worktree = tempDir()
+    const external = tempDir()
+    const { context, asks } = mockContext(worktree)
+
+    await askLocalPathPermission(context as any, "read", join(external, "file.txt"))
+
+    expect(asks.map((ask) => ask.permission)).toEqual(["external_directory", "read"])
+    expect(asks[0].patterns[0]).toBe(`${external}/*`)
+  })
+
+  test("uses canonical remote paths without comparing them to the local worktree", async () => {
+    const { context, asks } = mockContext(tempDir())
+
+    await askRemotePathPermission(context as any, {
+      permission: "read",
+      path: "/srv/app/../secrets/token",
+      workspaceRoots: ["/srv/app"],
+      target: "prod",
+    })
+
+    expect(asks.map((ask) => ask.permission)).toEqual(["external_directory", "read"])
+    expect(asks[0].patterns).toEqual(["/srv/secrets/*"])
+    expect(asks[1].patterns).toEqual(["/srv/secrets/token"])
+  })
+
+  test("treats OpenCode's root worktree sentinel as outside the project directory", async () => {
+    const directory = tempDir()
+    const external = tempDir()
+    const { context, asks } = mockContext(directory, "/")
+
+    await askLocalPathPermission(context as any, "read", join(external, "file.txt"))
+
+    expect(asks.map((ask) => ask.permission)).toEqual(["external_directory", "read"])
+  })
+
+  test("uses search queries as glob and grep permission patterns", async () => {
+    const directory = tempDir()
+    const plugin = await RexdTargetPlugin({} as any)
+    for (const [toolName, args, expected] of [
+      ["glob", { pattern: "**/*.env" }, "**/*.env"],
+      ["grep", { pattern: "SECRET" }, "SECRET"],
+    ] as const) {
+      const { context, asks } = mockContext(directory)
+      context.ask = async (input: any) => {
+        asks.push(input)
+        throw new Error("stop before execution")
+      }
+      await expect((plugin.tool![toolName] as any).execute(args, context)).rejects.toThrow("stop before execution")
+      expect(asks[0].patterns).toEqual([expected])
+    }
+  })
+
+  test("requires a conservative approval for compound shell commands", async () => {
+    const directory = tempDir()
+    const plugin = await RexdTargetPlugin({} as any)
+
+    for (const command of ["git status && rm -rf build", "git status & rm -rf build"]) {
+      const { context, asks } = mockContext(directory)
+      context.ask = async (input: any) => {
+        asks.push(input)
+        throw new Error("stop before execution")
+      }
+      await expect((plugin.tool!.bash as any).execute({ command }, context)).rejects.toThrow("stop before execution")
+      expect(asks[0].permission).toBe("bash")
+      expect(asks[0].patterns).toEqual([command, "*"])
+    }
+  })
+
+  test("asks external-directory permission for relative and home shell paths", async () => {
+    const directory = tempDir()
+    const plugin = await RexdTargetPlugin({} as any)
+
+    for (const command of ["cat ../secret", "cat ~/secret", "cat $HOME/secret", "cat ${HOME}/secret"]) {
+      const { context, asks } = mockContext(directory)
+      context.ask = async (input: any) => {
+        asks.push(input)
+        throw new Error("stop before execution")
+      }
+      await expect((plugin.tool!.bash as any).execute({ command }, context)).rejects.toThrow("stop before execution")
+      expect(asks[0].permission).toBe("external_directory")
+    }
+  })
+
+  test("does not assume a remote user's home directory", async () => {
+    const { context, asks } = mockContext(tempDir())
+    context.ask = async (input: any) => {
+      asks.push(input)
+      throw new Error("stop before execution")
+    }
+
+    await expect(
+      askBashPermission(context as any, "cat ~/secret", "/srv/app", {
+        target: "deploy",
+        workspaceRoots: ["/srv/app"],
+      }),
+    ).rejects.toThrow("stop before execution")
+    expect(asks[0]).toMatchObject({ permission: "external_directory", patterns: ["*"] })
+  })
+
+  test("blocks disabled target capabilities before transport work", () => {
+    const target = { transport: "ssh" as const, capabilities: { shell: false, fs: false, pty: false } }
+    expect(() => assertTargetCapabilities("locked", target, ["shell"])).toThrow("does not support shell")
+    expect(() => assertTargetCapabilities("locked", target, ["fs"])).toThrow("does not support fs")
+    expect(() => assertTargetCapabilities("locked", target, ["pty"])).toThrow("does not support pty")
+  })
+})
+
+describe("session state", () => {
+  test("an active persisted state cannot execute the real bash tool locally", async () => {
+    const dir = tempDir()
+    const marker = join(dir, "must-not-exist")
+    const { context } = mockContext(dir)
+    const path = sessionStatePath(context.sessionID)
+    stateFiles.push(path)
+    mkdirSync(dirname(path), { recursive: true })
+    writeFileSync(path, JSON.stringify({ activeTargetAlias: "missing-target", lastUsedAt: 0 }))
+    const plugin = await RexdTargetPlugin({} as any)
+
+    await expect((plugin.tool!.bash as any).execute({ command: `touch '${marker}'` }, context)).rejects.toThrow(
+      "is not configured",
+    )
+    expect(existsSync(marker)).toBe(false)
+  })
+
+  test("a corrupt persisted state cannot execute the real bash tool locally", async () => {
+    const dir = tempDir()
+    const marker = join(dir, "must-not-exist")
+    const { context } = mockContext(dir)
+    const path = sessionStatePath(context.sessionID)
+    stateFiles.push(path)
+    mkdirSync(dirname(path), { recursive: true })
+    writeFileSync(path, "{")
+    utimesSync(path, new Date(0), new Date(0))
+    const plugin = await RexdTargetPlugin({} as any)
+
+    await expect((plugin.tool!.bash as any).execute({ command: `touch '${marker}'` }, context)).rejects.toThrow(
+      "corrupt or invalid",
+    )
+    expect(existsSync(marker)).toBe(false)
+  })
+
+  test("an active state routes away from local execution", async () => {
+    const dir = tempDir()
+    const path = join(dir, "state.json")
+    saveSessionStateToPath(path, { activeTargetAlias: "prod", remoteCwdOverride: null, lastUsedAt: 1 })
+    const state = loadSessionStateFromPath(path)
+    let localRuns = 0
+    let remoteRuns = 0
+
+    await expect(
+      executeForSessionState(state, {
+        local: async () => {
+          localRuns++
+          return "local"
+        },
+        remote: async () => {
+          remoteRuns++
+          return "remote"
+        },
+      }),
+    ).resolves.toBe("remote")
+    expect(localRuns).toBe(0)
+    expect(remoteRuns).toBe(1)
+  })
+
+  test("a corrupt state fails closed without invoking local execution", async () => {
+    const dir = tempDir()
+    const path = join(dir, "state.json")
+    writeFileSync(path, '{"activeTargetAlias":null}')
+    let localRuns = 0
+
+    try {
+      await executeForSessionState(loadSessionStateFromPath(path), {
+        local: async () => {
+          localRuns++
+          return "local"
+        },
+        remote: async () => "remote",
+      })
+    } catch (error) {
+      expect(String(error)).toContain("corrupt or invalid")
+    }
+    expect(localRuns).toBe(0)
+  })
+
+  test("a valid inactive state still routes locally", async () => {
+    let localRuns = 0
+    const result = await executeForSessionState(
+      { activeTargetAlias: null, remoteCwdOverride: null, lastUsedAt: 1 },
+      {
+        local: async () => {
+          localRuns++
+          return "local"
+        },
+        remote: async () => "remote",
+      },
+    )
+    expect(result).toBe("local")
+    expect(localRuns).toBe(1)
+  })
+
+  test("writes validated session state atomically and cleans a failed temp file", () => {
+    const dir = tempDir()
+    const path = join(dir, "state.json")
+    const state = { activeTargetAlias: null, remoteCwdOverride: null, lastUsedAt: 1 }
+    saveSessionStateToPath(path, state)
+    expect(loadSessionStateFromPath(path)).toEqual(state)
+
+    expect(() => saveSessionStateToPath(path, state, { rename: () => { throw new Error("rename failed") } })).toThrow(
+      "rename failed",
+    )
+    expect(readdirSync(dir).filter((entry) => entry.endsWith(".tmp"))).toEqual([])
+    expect(() => saveSessionStateToPath(path, { ...state, ignored: true } as any)).toThrow("unknown fields")
+  })
+})
+
+describe("execution safety", () => {
+  test("preserves stdout/stderr arrival order and bounds retained output", () => {
+    const buffer = createExecBuffer()
+    appendExecOutput(buffer, "stdout", "one")
+    appendExecOutput(buffer, "stderr", "two")
+    appendExecOutput(buffer, "stdout", "three")
+    expect(renderExecOutput(buffer)).toBe("onetwothree")
+    expect(outputChunks(buffer).map((chunk) => chunk.stream)).toEqual(["stdout", "stderr", "stdout"])
+
+    appendExecOutput(buffer, "stdout", "x".repeat(1_100_000))
+    expect(Buffer.byteLength(outputChunks(buffer).map((chunk) => chunk.data).join(""), "utf8")).toBeLessThanOrEqual(1024 * 1024)
+    expect(renderExecOutput(buffer)).toContain("plugin output safety cap reached")
+
+    const fragmented = createExecBuffer()
+    for (let index = 0; index < 5000; index++) appendExecOutput(fragmented, index % 2 ? "stdout" : "stderr", "x")
+    expect(outputChunks(fragmented).length).toBeLessThanOrEqual(4096)
+    expect(renderExecOutput(fragmented)).toContain("plugin output safety cap reached")
+  })
+
+  test("cancels a local process", async () => {
+    const controller = new AbortController()
+    const running = runLocalExec("sleep 5", { cwd: tempDir(), signal: controller.signal })
+    setTimeout(() => controller.abort(), 20)
+    await expect(running).rejects.toThrow("Operation cancelled")
+  })
+
+  test("kills a remote process that starts after cancellation", async () => {
+    let resolveStart!: (value: string) => void
+    const start = new Promise<string>((resolve) => {
+      resolveStart = resolve
+    })
+    const controller = new AbortController()
+    const killed: string[] = []
+    const running = runRemoteProcessLifecycle(
+      {
+        start: () => start,
+        wait: async () => ({ exit_code: 0 }),
+        kill: async (id) => {
+          killed.push(id)
+        },
+        cleanup() {},
+      },
+      controller.signal,
+    )
+    controller.abort()
+    await expect(running).rejects.toThrow("Operation cancelled")
+    resolveStart("process-1")
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(killed).toEqual(["process-1"])
+  })
+})
+
+describe("structured results and bash timeout compatibility", () => {
+  test("returns edit and patch UI metadata directly", async () => {
+    const dir = tempDir()
+    const { context, asks } = mockContext(dir)
+    writeFileSync(join(dir, "file.txt"), "before")
+    const plugin = await RexdTargetPlugin({} as any)
+    const edit = await (plugin.tool!.edit as any).execute(
+      { filePath: "file.txt", oldString: "before", newString: "after" },
+      context,
+    )
+    expect(edit.metadata.filediff.patch).toContain("-before")
+    expect(edit.title).toBe("file.txt")
+    expect(plugin["tool.execute.after"]).toBeUndefined()
+
+    const patch = await (plugin.tool!.apply_patch as any).execute(
+      { patchText: "*** Begin Patch\n*** Update File: file.txt\n@@\n-after\n+patched\n*** End Patch" },
+      context,
+    )
+    expect(patch.metadata.files[0].patch).toContain("-after")
+
+    await (plugin.tool!.list as any).execute({}, context)
+    expect(asks.at(-1).permission).toBe("read")
+  })
+
+  test("accepts deprecated timeout_ms while timeout takes precedence", () => {
+    expect(resolveBashTimeout({ timeout_ms: 10 })).toBe(10)
+    expect(resolveBashTimeout({ timeout: 20, timeout_ms: 10 })).toBe(20)
+    expect(() => resolveBashTimeout({ timeout: -1 })).toThrow("Invalid timeout")
   })
 })

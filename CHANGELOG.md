@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.3.6 - 2026-07-23
+
+- Add explicit OpenCode permission checks, capability enforcement, cancellation, bounded ordered command output, and hardened session/SSH cleanup.
+- Return edit and patch UI metadata directly through the public plugin API and rename `bash.timeout_ms` to `timeout` (with temporary compatibility support).
+- Update the tested OpenCode plugin dependency and CI coverage.
+
 ## v0.3.5 - 2026-06-18
 
 - Fix `read` tool parity with current OpenCode for images and PDFs: local and remote reads now return media attachments instead of decoding binary data as UTF-8 text.
