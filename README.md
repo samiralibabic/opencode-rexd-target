@@ -43,7 +43,7 @@ curl -fsSL https://raw.githubusercontent.com/samiralibabic/opencode-rexd-target/
 Pinned version:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/samiralibabic/opencode-rexd-target/main/scripts/install.sh | OPENCODE_REXD_TARGET_VERSION=v0.3.6 bash
+curl -fsSL https://raw.githubusercontent.com/samiralibabic/opencode-rexd-target/main/scripts/install.sh | OPENCODE_REXD_TARGET_VERSION=v0.3.7 bash
 ```
 
 The installer places files in your OpenCode config directory:
@@ -85,6 +85,10 @@ Example `~/.config/rexd/targets.json`:
 
 `capabilities.shell` controls whether the plugin exposes remote shell execution. Remote shell commands run with the privileges of the remote `rexd` process user and are not constrained by filesystem RPC root guards. Set `capabilities.shell: false` and `security.allow_shell = false` on the target host when filesystem roots must be the hard security boundary.
 
+The plugin preserves OpenCode's `bash` permission policy. Local fallback uses native-style command families such as `git log *`. Remote permission patterns use the same families inside a target-specific namespace, so an approval for one target cannot authorize local execution or another target. Broad `bash` policies (`allow`, `ask`, or `deny`) still apply; command-specific remote rules use the namespaced pattern shown in OpenCode's approval dialog.
+
+Subagents resolve target state through their live OpenCode parent-session chain on every operation. The nearest explicit state wins, parent target changes are visible on the child's next operation, and corrupt ancestor state fails closed.
+
 ## Usage
 
 In OpenCode:
@@ -112,7 +116,7 @@ Update commands:
 curl -fsSL https://raw.githubusercontent.com/samiralibabic/rexd/main/scripts/install.sh | REXD_VERSION=v0.1.5 bash
 
 # 2) local plugin
-curl -fsSL https://raw.githubusercontent.com/samiralibabic/opencode-rexd-target/main/scripts/install.sh | OPENCODE_REXD_TARGET_VERSION=v0.3.6 bash
+curl -fsSL https://raw.githubusercontent.com/samiralibabic/opencode-rexd-target/main/scripts/install.sh | OPENCODE_REXD_TARGET_VERSION=v0.3.7 bash
 ```
 
 If you update the plugin before `rexd`, remote `edit`/`apply_patch` calls can fail with method-not-found errors on older servers.

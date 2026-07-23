@@ -14,11 +14,12 @@ import { createHash, randomUUID } from "node:crypto"
 import { homedir } from "node:os"
 import { dirname, isAbsolute, posix, relative, resolve } from "node:path"
 import { createTwoFilesPatch } from "diff"
+import { buildBashPermissionRequest } from "./bash-permission"
 
 const TARGETS_PATH = resolve(homedir(), ".config/rexd/targets.json")
 const SESSION_STATE_ROOT = resolve(homedir(), ".config/opencode/rexd-target/sessions")
 const SESSION_STATE_TTL_MS = 1000 * 60 * 60 * 24 * 90
-const CLIENT_VERSION = "0.3.6"
+const CLIENT_VERSION = "0.3.7"
 const DEFAULT_READ_LIMIT = 2000
 const SAMPLE_BYTES = 4096
 const EXEC_OUTPUT_MAX_BYTES = 1024 * 1024
@@ -78,6 +79,16 @@ export type SessionState = {
   activeTargetAlias: string | null
   remoteCwdOverride?: string | null
   lastUsedAt: number
+}
+
+export type EffectiveSessionState = {
+  state: SessionState
+  ownerSessionID: string
+}
+
+type SessionStateResolverDependencies = {
+  getSession: (sessionID: string) => Promise<{ id: string; parentID?: string }>
+  loadState: (sessionID: string) => SessionState | undefined
 }
 
 type PendingRequest = {
@@ -304,14 +315,42 @@ function loadSessionState(opencodeSessionID: string): SessionState {
   return existsSync(path) ? loadSessionStateFromPath(path) : defaultSessionState()
 }
 
-function saveSessionState(opencodeSessionID: string, state: SessionState): void {
-  saveSessionStateToPath(sessionStatePath(opencodeSessionID), state)
+function loadSessionStateIfPresent(opencodeSessionID: string): SessionState | undefined {
+  const path = sessionStatePath(opencodeSessionID)
+  return existsSync(path) ? loadSessionStateFromPath(path) : undefined
 }
 
-function touchSessionState(opencodeSessionID: string, state = loadSessionState(opencodeSessionID)): void {
-  if (!state.activeTargetAlias) return
-  state.lastUsedAt = Date.now()
-  saveSessionState(opencodeSessionID, state)
+export async function resolveEffectiveSessionState(
+  opencodeSessionID: string,
+  dependencies: SessionStateResolverDependencies,
+): Promise<EffectiveSessionState> {
+  const visited = new Set<string>()
+  let current = opencodeSessionID
+
+  while (true) {
+    if (visited.has(current)) throw new Error(`Session ancestry cycle detected at "${current}"`)
+    visited.add(current)
+
+    const state = dependencies.loadState(current)
+    if (state) return { state, ownerSessionID: current }
+
+    let session: { id: string; parentID?: string }
+    try {
+      session = await dependencies.getSession(current)
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error)
+      throw new Error(`Could not resolve target state for session "${current}": ${detail}`)
+    }
+    if (!session || session.id !== current) {
+      throw new Error(`Could not resolve target state for session "${current}": invalid session response`)
+    }
+    if (!session.parentID) return { state: defaultSessionState(), ownerSessionID: current }
+    current = session.parentID
+  }
+}
+
+function saveSessionState(opencodeSessionID: string, state: SessionState): void {
+  saveSessionStateToPath(sessionStatePath(opencodeSessionID), state)
 }
 
 function pruneSessionStateFiles(now = Date.now()): void {
@@ -509,16 +548,23 @@ async function askRemoteSearchPermission(
   },
 ): Promise<void> {
   const path = normalizeRemotePath(input.path)
-  await askPermission(context, input.permission, [input.query], ["*"], {
-    ...input.metadata,
-    filepath: path,
-    target: input.target,
-    remote: true,
-  })
+  await askPermission(
+    context,
+    input.permission,
+    [remotePermissionPattern(input.target, input.query)],
+    [remotePermissionPattern(input.target, "*")],
+    {
+      ...input.metadata,
+      filepath: path,
+      target: input.target,
+      remote: true,
+    },
+  )
   const roots = input.workspaceRoots.map(normalizeRemotePath)
   if (roots.length > 0 && !roots.some((root) => inRoot(path, root))) {
     const pattern = remoteExternalPattern(path, "directory")
-    await askPermission(context, "external_directory", [pattern], [pattern], {
+    const scoped = remotePermissionPattern(input.target, pattern)
+    await askPermission(context, "external_directory", [scoped], [scoped], {
       ...input.metadata,
       filepath: path,
       parentDir: path,
@@ -549,8 +595,13 @@ function shellPaths(command: string, cwd: string, remote: boolean): string[] {
   return [...paths]
 }
 
-function shellPermissionPatterns(command: string): string[] {
-  return /[&;|\n`<>]|\$\(/.test(command) ? [command, "*"] : [command]
+export function remotePermissionScope(target: string): string {
+  const identity = createHash("sha256").update(`rexd-target\0${target}`).digest("hex")
+  return `rexd.remote.${identity}:`
+}
+
+function remotePermissionPattern(target: string, pattern: string): string {
+  return `${remotePermissionScope(target)}${pattern}`
 }
 
 export async function askRemotePathPermission(
@@ -569,7 +620,8 @@ export async function askRemotePathPermission(
   const roots = input.workspaceRoots.map(normalizeRemotePath)
   if (roots.length > 0 && !roots.some((root) => inRoot(path, root))) {
     const pattern = remoteExternalPattern(path, kind)
-    await askPermission(context, "external_directory", [pattern], [pattern], {
+    const scoped = remotePermissionPattern(input.target, pattern)
+    await askPermission(context, "external_directory", [scoped], [scoped], {
       ...(input.metadata ?? {}),
       filepath: path,
       parentDir: kind === "directory" ? path : posix.dirname(path),
@@ -577,12 +629,18 @@ export async function askRemotePathPermission(
       remote: true,
     })
   }
-  await askPermission(context, input.permission, [path], ["*"], {
-    ...(input.metadata ?? {}),
-    filepath: path,
-    target: input.target,
-    remote: true,
-  })
+  await askPermission(
+    context,
+    input.permission,
+    [remotePermissionPattern(input.target, path)],
+    [remotePermissionPattern(input.target, "*")],
+    {
+      ...(input.metadata ?? {}),
+      filepath: path,
+      target: input.target,
+      remote: true,
+    },
+  )
 }
 
 export async function askBashPermission(
@@ -595,7 +653,8 @@ export async function askBashPermission(
     const roots = remote.workspaceRoots.map(normalizeRemotePath)
     if (roots.length > 0 && !roots.some((root) => inRoot(cwd, root))) {
       const pattern = remoteExternalPattern(cwd, "directory")
-      await askPermission(context, "external_directory", [pattern], [pattern], {
+      const scoped = remotePermissionPattern(remote.target, pattern)
+      await askPermission(context, "external_directory", [scoped], [scoped], {
         command,
         cwd,
         target: remote.target,
@@ -603,7 +662,8 @@ export async function askBashPermission(
       })
     }
     if (/(?:^|[\s"'=])(?:~\/|\$HOME\/|\$\{HOME\}\/)/.test(command)) {
-      await askPermission(context, "external_directory", ["*"], ["*"], {
+      const scoped = remotePermissionPattern(remote.target, "*")
+      await askPermission(context, "external_directory", [scoped], [scoped], {
         command,
         filepath: "remote home directory",
         target: remote.target,
@@ -613,7 +673,8 @@ export async function askBashPermission(
     for (const path of shellPaths(command, cwd, true)) {
       if (roots.some((root) => inRoot(normalizeRemotePath(path), root))) continue
       const pattern = remoteExternalPattern(normalizeRemotePath(path), "file")
-      await askPermission(context, "external_directory", [pattern], [pattern], {
+      const scoped = remotePermissionPattern(remote.target, pattern)
+      await askPermission(context, "external_directory", [scoped], [scoped], {
         command,
         filepath: normalizeRemotePath(path),
         target: remote.target,
@@ -633,10 +694,14 @@ export async function askBashPermission(
     }
   }
 
-  await askPermission(context, "bash", shellPermissionPatterns(command), [command], {
+  const request = buildBashPermissionRequest(command, {
+    remoteScope: remote ? remotePermissionScope(remote.target) : undefined,
+  })
+  if (request.patterns.length === 0) return
+  await askPermission(context, "bash", request.patterns, request.always, {
     command,
     cwd,
-    ...(remote ? { target: remote.target, remote: true } : {}),
+    ...(remote ? { target: remote.target, remote: true, permissionScope: remotePermissionScope(remote.target) } : {}),
   })
 }
 
@@ -1904,8 +1969,6 @@ async function ensureConnection(opencodeSessionID: string, state = loadSessionSt
   const { alias, target } = configuredActiveTarget(state)
   if (signal) throwIfAborted(signal)
 
-  touchSessionState(opencodeSessionID, state)
-
   const key = connectionKey(opencodeSessionID, alias)
   const existing = connections.get(key)
   if (existing && isAlive(existing)) {
@@ -1915,8 +1978,7 @@ async function ensureConnection(opencodeSessionID: string, state = loadSessionSt
   return await createConnection(opencodeSessionID, alias, target, signal)
 }
 
-function getPtyNoRemoteTargetMessage(opencodeSessionID: string): string | null {
-  const state = loadSessionState(opencodeSessionID)
+function getPtyNoRemoteTargetMessage(state: SessionState): string | null {
   if (state.activeTargetAlias) return null
   return "No remote target selected for this chat. PTY is remote-only. Commands run locally. Use /target use <alias> for a remote target."
 }
@@ -1925,6 +1987,14 @@ function disconnectAlias(opencodeSessionID: string, alias: string): void {
   const key = connectionKey(opencodeSessionID, alias)
   const connection = connections.get(key)
   if (connection) closeConnection(connection, "Disconnected")
+}
+
+function reconcileSessionConnections(opencodeSessionID: string, state: SessionState): void {
+  for (const connection of connections.values()) {
+    if (connection.opencodeSessionID !== opencodeSessionID) continue
+    if (state.activeTargetAlias === connection.alias) continue
+    closeConnection(connection, "Target selection changed")
+  }
 }
 
 type ExecResult = { output: ExecBuffer; exitCode: number }
@@ -2203,11 +2273,18 @@ export function resolveBashTimeout(input: { timeout?: number; timeout_ms?: numbe
   return timeout
 }
 
-async function handleTargetSubcommand(opencodeSessionID: string, subcommand: string, alias?: string): Promise<string> {
+type EffectiveStateResolver = (sessionID: string) => Promise<EffectiveSessionState>
+
+async function handleTargetSubcommand(
+  opencodeSessionID: string,
+  subcommand: string,
+  alias: string | undefined,
+  resolveState: EffectiveStateResolver,
+): Promise<string> {
   switch (subcommand) {
     case "list": {
       const targets = loadTargets()
-      const state = loadSessionState(opencodeSessionID)
+      const { state } = await resolveState(opencodeSessionID)
       const list = Object.entries(targets)
         .map(([name, config]) => {
           const active = state.activeTargetAlias === name ? "*" : " "
@@ -2235,7 +2312,7 @@ async function handleTargetSubcommand(opencodeSessionID: string, subcommand: str
 
       pruneSessionStateFiles()
 
-      const previous = loadSessionState(opencodeSessionID).activeTargetAlias
+      const previous = (await resolveState(opencodeSessionID)).state.activeTargetAlias
       try {
         await createConnection(opencodeSessionID, alias, target)
       } catch (error) {
@@ -2254,12 +2331,10 @@ async function handleTargetSubcommand(opencodeSessionID: string, subcommand: str
     }
 
     case "status": {
-      const state = loadSessionState(opencodeSessionID)
+      const { state } = await resolveState(opencodeSessionID)
       if (!state.activeTargetAlias) {
         return "No remote target selected for this chat. Commands run locally. Use /target use <alias> for a remote target."
       }
-
-      touchSessionState(opencodeSessionID, state)
 
       const target = getTarget(state.activeTargetAlias)
       const host = target?.host || "unknown"
@@ -2272,12 +2347,13 @@ async function handleTargetSubcommand(opencodeSessionID: string, subcommand: str
     }
 
     case "clear": {
-      const state = loadSessionState(opencodeSessionID)
-      if (!state.activeTargetAlias) return "No active target to clear for this chat."
+      const effective = (await resolveState(opencodeSessionID)).state
+      if (!effective.activeTargetAlias) return "No active target to clear for this chat."
 
-      const previous = state.activeTargetAlias
+      const previous = effective.activeTargetAlias
       disconnectAlias(opencodeSessionID, previous)
 
+      const state = loadSessionState(opencodeSessionID)
       state.activeTargetAlias = null
       state.remoteCwdOverride = null
       state.lastUsedAt = Date.now()
@@ -2290,15 +2366,34 @@ async function handleTargetSubcommand(opencodeSessionID: string, subcommand: str
   }
 }
 
-export const RexdTargetPlugin: Plugin = async () => {
+export const RexdTargetPlugin: Plugin = async (input) => {
   pruneSessionStateFiles()
+
+  const resolveState: EffectiveStateResolver = async (sessionID) => {
+    const resolved = await resolveEffectiveSessionState(sessionID, {
+      loadState: loadSessionStateIfPresent,
+      getSession: async (id) => {
+        const result = await input.client.session.get({
+          path: { id },
+          query: { directory: input.directory },
+        })
+        if (result.error || !result.data) {
+          const detail = result.error ? JSON.stringify(result.error) : "session was not found"
+          throw new Error(detail)
+        }
+        return { id: result.data.id, parentID: result.data.parentID }
+      },
+    })
+    reconcileSessionConnections(sessionID, resolved.state)
+    return resolved
+  }
 
   return {
     "command.execute.before": async (input, output) => {
       const parsed = parseTargetCommand(input)
       if (!parsed) return
 
-      const message = await handleTargetSubcommand(input.sessionID, parsed.subcommand, parsed.alias)
+      const message = await handleTargetSubcommand(input.sessionID, parsed.subcommand, parsed.alias, resolveState)
       setCommandText(output, message)
     },
 
@@ -2310,7 +2405,7 @@ export const RexdTargetPlugin: Plugin = async () => {
           alias: tool.schema.string().optional().describe("Target alias for use"),
         },
         async execute(args, context: ToolContext) {
-          return await handleTargetSubcommand(context.sessionID, args.action, args.alias)
+          return await handleTargetSubcommand(context.sessionID, args.action, args.alias, resolveState)
         },
       }),
 
@@ -2324,7 +2419,7 @@ export const RexdTargetPlugin: Plugin = async () => {
           workdir: tool.schema.string().optional().describe("Working directory"),
         },
         async execute(args, context: ToolContext) {
-          const state = loadSessionState(context.sessionID)
+          const { state } = await resolveState(context.sessionID)
           const timeoutMs = resolveBashTimeout(args)
           return await executeForSessionState(state, {
             local: async () => {
@@ -2367,7 +2462,7 @@ export const RexdTargetPlugin: Plugin = async () => {
           limit: tool.schema.number().optional().describe("Max lines to return"),
         },
         async execute(args, context: ToolContext) {
-          const state = loadSessionState(context.sessionID)
+          const { state } = await resolveState(context.sessionID)
           return await executeForSessionState(state, {
             local: async () => {
               const path = localPath(context.directory, args.filePath)
@@ -2400,7 +2495,7 @@ export const RexdTargetPlugin: Plugin = async () => {
           content: tool.schema.string().describe("File content"),
         },
         async execute(args, context: ToolContext) {
-          const state = loadSessionState(context.sessionID)
+          const { state } = await resolveState(context.sessionID)
           return await executeForSessionState(state, {
             local: async () => {
               const path = localPath(context.directory, args.filePath)
@@ -2452,7 +2547,7 @@ export const RexdTargetPlugin: Plugin = async () => {
           replaceAll: tool.schema.boolean().optional().describe("Replace all matches"),
         },
         async execute(args, context: ToolContext) {
-          const state = loadSessionState(context.sessionID)
+          const { state } = await resolveState(context.sessionID)
           return await executeForSessionState(state, {
             local: async () => {
               const path = localPath(context.directory, args.filePath)
@@ -2524,7 +2619,7 @@ export const RexdTargetPlugin: Plugin = async () => {
           patchText: tool.schema.string().describe("Patch text in apply_patch envelope format"),
         },
         async execute(args, context: ToolContext) {
-          const state = loadSessionState(context.sessionID)
+          const { state } = await resolveState(context.sessionID)
           return await executeForSessionState(state, {
             local: async () => {
               const hunks = parsePatchEnvelope(args.patchText)
@@ -2595,7 +2690,7 @@ export const RexdTargetPlugin: Plugin = async () => {
           filePath: tool.schema.string().optional().describe("Directory path"),
         },
         async execute(args, context: ToolContext) {
-          const state = loadSessionState(context.sessionID)
+          const { state } = await resolveState(context.sessionID)
           return await executeForSessionState(state, {
             local: async () => {
               const path = localPath(context.directory, args.filePath ?? ".")
@@ -2645,7 +2740,7 @@ export const RexdTargetPlugin: Plugin = async () => {
           path: tool.schema.string().optional().describe("Base directory"),
         },
         async execute(args, context: ToolContext) {
-          const state = loadSessionState(context.sessionID)
+          const { state } = await resolveState(context.sessionID)
           return await executeForSessionState(state, {
             local: async () => {
               const cwd = localPath(context.directory, args.path ?? ".")
@@ -2701,7 +2796,7 @@ export const RexdTargetPlugin: Plugin = async () => {
           include: tool.schema.string().optional().describe("Glob include filter"),
         },
         async execute(args, context: ToolContext) {
-          const state = loadSessionState(context.sessionID)
+          const { state } = await resolveState(context.sessionID)
           return await executeForSessionState(state, {
             local: async () => {
               const searchPath = localPath(context.directory, args.path ?? ".")
@@ -2749,8 +2844,8 @@ export const RexdTargetPlugin: Plugin = async () => {
           rows: tool.schema.number().optional().describe("Terminal rows"),
         },
         async execute(args, context: ToolContext) {
-          const state = loadSessionState(context.sessionID)
-          if (!state.activeTargetAlias) return getPtyNoRemoteTargetMessage(context.sessionID)!
+          const { state } = await resolveState(context.sessionID)
+          if (!state.activeTargetAlias) return getPtyNoRemoteTargetMessage(state)!
           const { alias, target } = configuredActiveTarget(state)
           assertTargetCapabilities(alias, target, ["pty", "shell"])
           const cwd = configuredRemoteCwd(target)
@@ -2802,8 +2897,8 @@ export const RexdTargetPlugin: Plugin = async () => {
           data: tool.schema.string().describe("Input data"),
         },
         async execute(args, context: ToolContext) {
-          const state = loadSessionState(context.sessionID)
-          if (!state.activeTargetAlias) return getPtyNoRemoteTargetMessage(context.sessionID)!
+          const { state } = await resolveState(context.sessionID)
+          if (!state.activeTargetAlias) return getPtyNoRemoteTargetMessage(state)!
           const { alias, target } = configuredActiveTarget(state)
           assertTargetCapabilities(alias, target, ["pty", "shell"])
           await askBashPermission(context, args.data, configuredRemoteCwd(target), {
@@ -2829,8 +2924,8 @@ export const RexdTargetPlugin: Plugin = async () => {
           limit: tool.schema.number().optional().describe("Number of chunks to read"),
         },
         async execute(args, context: ToolContext) {
-          const state = loadSessionState(context.sessionID)
-          if (!state.activeTargetAlias) return getPtyNoRemoteTargetMessage(context.sessionID)!
+          const { state } = await resolveState(context.sessionID)
+          if (!state.activeTargetAlias) return getPtyNoRemoteTargetMessage(state)!
           const { alias, target } = configuredActiveTarget(state)
           assertTargetCapabilities(alias, target, ["pty"])
           const connection = await ensureConnection(context.sessionID, state, context.abort)
@@ -2844,8 +2939,8 @@ export const RexdTargetPlugin: Plugin = async () => {
         description: "List known PTY sessions",
         args: {},
         async execute(_, context: ToolContext) {
-          const state = loadSessionState(context.sessionID)
-          if (!state.activeTargetAlias) return getPtyNoRemoteTargetMessage(context.sessionID)!
+          const { state } = await resolveState(context.sessionID)
+          if (!state.activeTargetAlias) return getPtyNoRemoteTargetMessage(state)!
           const { alias, target } = configuredActiveTarget(state)
           assertTargetCapabilities(alias, target, ["pty"])
           const connection = await ensureConnection(context.sessionID, state, context.abort)
@@ -2860,8 +2955,8 @@ export const RexdTargetPlugin: Plugin = async () => {
           id: tool.schema.string().describe("PTY id"),
         },
         async execute(args, context: ToolContext) {
-          const state = loadSessionState(context.sessionID)
-          if (!state.activeTargetAlias) return getPtyNoRemoteTargetMessage(context.sessionID)!
+          const { state } = await resolveState(context.sessionID)
+          if (!state.activeTargetAlias) return getPtyNoRemoteTargetMessage(state)!
           const { alias, target } = configuredActiveTarget(state)
           assertTargetCapabilities(alias, target, ["pty"])
           const connection = await ensureConnection(context.sessionID, state, context.abort)

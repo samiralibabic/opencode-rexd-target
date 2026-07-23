@@ -11,7 +11,9 @@ import {
   loadSessionStateFromPath,
   outputChunks,
   readLocalResolvedPath,
+  remotePermissionScope,
   renderExecOutput,
+  resolveEffectiveSessionState,
   resolveBashTimeout,
   RexdTargetPlugin,
   runLocalExec,
@@ -153,6 +155,22 @@ function mockContext(directory: string, worktree = directory) {
   }
 }
 
+function mockPluginInput(directory: string, parents: Record<string, string | undefined> = {}) {
+  return {
+    directory,
+    client: {
+      session: {
+        async get({ path }: { path: { id: string } }) {
+          return {
+            data: { id: path.id, directory, parentID: parents[path.id] },
+            error: undefined,
+          }
+        },
+      },
+    },
+  } as any
+}
+
 describe("permissions and capabilities", () => {
   test("asks external_directory before a local path permission outside the worktree", async () => {
     const worktree = tempDir()
@@ -175,9 +193,10 @@ describe("permissions and capabilities", () => {
       target: "prod",
     })
 
+    const scope = remotePermissionScope("prod")
     expect(asks.map((ask) => ask.permission)).toEqual(["external_directory", "read"])
-    expect(asks[0].patterns).toEqual(["/srv/secrets/*"])
-    expect(asks[1].patterns).toEqual(["/srv/secrets/token"])
+    expect(asks[0].patterns).toEqual([`${scope}/srv/secrets/*`])
+    expect(asks[1].patterns).toEqual([`${scope}/srv/secrets/token`])
   })
 
   test("treats OpenCode's root worktree sentinel as outside the project directory", async () => {
@@ -192,7 +211,7 @@ describe("permissions and capabilities", () => {
 
   test("uses search queries as glob and grep permission patterns", async () => {
     const directory = tempDir()
-    const plugin = await RexdTargetPlugin({} as any)
+    const plugin = await RexdTargetPlugin(mockPluginInput(directory))
     for (const [toolName, args, expected] of [
       ["glob", { pattern: "**/*.env" }, "**/*.env"],
       ["grep", { pattern: "SECRET" }, "SECRET"],
@@ -207,9 +226,9 @@ describe("permissions and capabilities", () => {
     }
   })
 
-  test("requires a conservative approval for compound shell commands", async () => {
+  test("uses native command patterns and reusable families for compound shell commands", async () => {
     const directory = tempDir()
-    const plugin = await RexdTargetPlugin({} as any)
+    const plugin = await RexdTargetPlugin(mockPluginInput(directory))
 
     for (const command of ["git status && rm -rf build", "git status & rm -rf build"]) {
       const { context, asks } = mockContext(directory)
@@ -219,13 +238,14 @@ describe("permissions and capabilities", () => {
       }
       await expect((plugin.tool!.bash as any).execute({ command }, context)).rejects.toThrow("stop before execution")
       expect(asks[0].permission).toBe("bash")
-      expect(asks[0].patterns).toEqual([command, "*"])
+      expect(asks[0].patterns).toEqual(["git status", "rm -rf build"])
+      expect(asks[0].always).toEqual(["git status *", "rm *"])
     }
   })
 
   test("asks external-directory permission for relative and home shell paths", async () => {
     const directory = tempDir()
-    const plugin = await RexdTargetPlugin({} as any)
+    const plugin = await RexdTargetPlugin(mockPluginInput(directory))
 
     for (const command of ["cat ../secret", "cat ~/secret", "cat $HOME/secret", "cat ${HOME}/secret"]) {
       const { context, asks } = mockContext(directory)
@@ -251,7 +271,25 @@ describe("permissions and capabilities", () => {
         workspaceRoots: ["/srv/app"],
       }),
     ).rejects.toThrow("stop before execution")
-    expect(asks[0]).toMatchObject({ permission: "external_directory", patterns: ["*"] })
+    const scope = remotePermissionScope("deploy")
+    expect(asks[0]).toMatchObject({ permission: "external_directory", patterns: [`${scope}*`] })
+  })
+
+  test("isolates remote bash approvals from local execution and other targets", async () => {
+    const command = "git log --oneline"
+    const local = mockContext(tempDir())
+    const targetA = mockContext(tempDir())
+    const targetB = mockContext(tempDir())
+
+    await askBashPermission(local.context as any, command, local.context.directory)
+    await askBashPermission(targetA.context as any, command, "/root", { target: "target-a", workspaceRoots: ["/root"] })
+    await askBashPermission(targetB.context as any, command, "/root", { target: "target-b", workspaceRoots: ["/root"] })
+
+    expect(local.asks[0]).toMatchObject({ permission: "bash", patterns: [command], always: ["git log *"] })
+    expect(targetA.asks[0].always).toEqual([`${remotePermissionScope("target-a")}git log *`])
+    expect(targetB.asks[0].always).toEqual([`${remotePermissionScope("target-b")}git log *`])
+    expect(targetA.asks[0].always).not.toEqual(targetB.asks[0].always)
+    expect(targetA.asks[0].always).not.toEqual(local.asks[0].always)
   })
 
   test("blocks disabled target capabilities before transport work", () => {
@@ -263,6 +301,91 @@ describe("permissions and capabilities", () => {
 })
 
 describe("session state", () => {
+  test("inherits active parent state and observes a later parent clear", async () => {
+    const dir = tempDir()
+    const marker = join(dir, "child-local-marker")
+    const parentID = `parent-${Math.random()}`
+    const childID = `child-${Math.random()}`
+    const parentPath = sessionStatePath(parentID)
+    stateFiles.push(parentPath)
+    saveSessionStateToPath(parentPath, {
+      activeTargetAlias: "missing-parent-target",
+      remoteCwdOverride: null,
+      lastUsedAt: Date.now(),
+    })
+    const { context } = mockContext(dir)
+    context.sessionID = childID
+    const plugin = await RexdTargetPlugin(mockPluginInput(dir, { [childID]: parentID }))
+
+    await expect((plugin.tool!.bash as any).execute({ command: `touch '${marker}'` }, context)).rejects.toThrow(
+      "is not configured",
+    )
+    expect(existsSync(marker)).toBe(false)
+
+    saveSessionStateToPath(parentPath, {
+      activeTargetAlias: null,
+      remoteCwdOverride: null,
+      lastUsedAt: Date.now(),
+    })
+    await (plugin.tool!.bash as any).execute({ command: `touch '${marker}'` }, context)
+    expect(existsSync(marker)).toBe(true)
+  })
+
+  test("fails closed when an inherited parent state is corrupt", async () => {
+    const dir = tempDir()
+    const marker = join(dir, "must-not-exist")
+    const parentID = `parent-${Math.random()}`
+    const childID = `child-${Math.random()}`
+    const parentPath = sessionStatePath(parentID)
+    stateFiles.push(parentPath)
+    mkdirSync(dirname(parentPath), { recursive: true })
+    writeFileSync(parentPath, "{")
+    const { context } = mockContext(dir)
+    context.sessionID = childID
+    const plugin = await RexdTargetPlugin(mockPluginInput(dir, { [childID]: parentID }))
+
+    await expect((plugin.tool!.bash as any).execute({ command: `touch '${marker}'` }, context)).rejects.toThrow(
+      "corrupt or invalid",
+    )
+    expect(existsSync(marker)).toBe(false)
+  })
+
+  test("uses nearest state and fails closed on ancestry lookup errors", async () => {
+    const active = { activeTargetAlias: "prod", remoteCwdOverride: null, lastUsedAt: 1 }
+    const inactive = { activeTargetAlias: null, remoteCwdOverride: null, lastUsedAt: 2 }
+    const sessions = new Map([
+      ["child", { id: "child", parentID: "parent" }],
+      ["parent", { id: "parent" }],
+    ])
+    const states = new Map<string, any>([["parent", active]])
+    const dependencies = {
+      getSession: async (id: string) => {
+        const session = sessions.get(id)
+        if (!session) throw new Error("missing session")
+        return session
+      },
+      loadState: (id: string) => states.get(id),
+    }
+
+    await expect(resolveEffectiveSessionState("child", dependencies)).resolves.toEqual({
+      state: active,
+      ownerSessionID: "parent",
+    })
+    states.set("child", inactive)
+    await expect(resolveEffectiveSessionState("child", dependencies)).resolves.toEqual({
+      state: inactive,
+      ownerSessionID: "child",
+    })
+    await expect(
+      resolveEffectiveSessionState("unknown", {
+        loadState: () => undefined,
+        getSession: async () => {
+          throw new Error("SDK unavailable")
+        },
+      }),
+    ).rejects.toThrow("SDK unavailable")
+  })
+
   test("an active persisted state cannot execute the real bash tool locally", async () => {
     const dir = tempDir()
     const marker = join(dir, "must-not-exist")
@@ -271,7 +394,7 @@ describe("session state", () => {
     stateFiles.push(path)
     mkdirSync(dirname(path), { recursive: true })
     writeFileSync(path, JSON.stringify({ activeTargetAlias: "missing-target", lastUsedAt: 0 }))
-    const plugin = await RexdTargetPlugin({} as any)
+    const plugin = await RexdTargetPlugin(mockPluginInput(dir))
 
     await expect((plugin.tool!.bash as any).execute({ command: `touch '${marker}'` }, context)).rejects.toThrow(
       "is not configured",
@@ -288,7 +411,7 @@ describe("session state", () => {
     mkdirSync(dirname(path), { recursive: true })
     writeFileSync(path, "{")
     utimesSync(path, new Date(0), new Date(0))
-    const plugin = await RexdTargetPlugin({} as any)
+    const plugin = await RexdTargetPlugin(mockPluginInput(dir))
 
     await expect((plugin.tool!.bash as any).execute({ command: `touch '${marker}'` }, context)).rejects.toThrow(
       "corrupt or invalid",
@@ -428,7 +551,7 @@ describe("structured results and bash timeout compatibility", () => {
     const dir = tempDir()
     const { context, asks } = mockContext(dir)
     writeFileSync(join(dir, "file.txt"), "before")
-    const plugin = await RexdTargetPlugin({} as any)
+    const plugin = await RexdTargetPlugin(mockPluginInput(dir))
     const edit = await (plugin.tool!.edit as any).execute(
       { filePath: "file.txt", oldString: "before", newString: "after" },
       context,

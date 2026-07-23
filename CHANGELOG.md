@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.3.7 - 2026-07-23
+
+- Match native OpenCode shell command-family approvals for local fallback and compound commands.
+- Namespace all remote permission patterns by target so approvals cannot leak to local execution or another target.
+- Resolve subagent target state dynamically through the nearest parent session, including immediate parent-clear behavior and fail-closed corrupt ancestry.
+- Keep `/target` slash-command prompt behavior unchanged pending upstream no-reply hook support.
+
 ## v0.3.6 - 2026-07-23
 
 - Add explicit OpenCode permission checks, capability enforcement, cancellation, bounded ordered command output, and hardened session/SSH cleanup.
