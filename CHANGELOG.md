@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.3.8 - 2026-07-31
+
+- Treat the exact local or remote `/dev/null` shell path as harmless without allowing other `/dev` entries.
+
 ## v0.3.7 - 2026-07-23
 
 - Match native OpenCode shell command-family approvals for local fallback and compound commands.

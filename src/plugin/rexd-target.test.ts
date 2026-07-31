@@ -275,6 +275,24 @@ describe("permissions and capabilities", () => {
     expect(asks[0]).toMatchObject({ permission: "external_directory", patterns: [`${scope}*`] })
   })
 
+  test("does not ask external-directory permission for /dev/null", async () => {
+    const command = "command -v git > /dev/null"
+    const local = mockContext(tempDir())
+    const remote = mockContext(tempDir())
+    const otherDevice = mockContext(tempDir())
+
+    await askBashPermission(local.context as any, command, local.context.directory)
+    await askBashPermission(remote.context as any, command, "/srv/app", {
+      target: "deploy",
+      workspaceRoots: ["/srv/app"],
+    })
+    await askBashPermission(otherDevice.context as any, "command -v git > /dev/tty", otherDevice.context.directory)
+
+    expect(local.asks.map((ask) => ask.permission)).toEqual(["bash"])
+    expect(remote.asks.map((ask) => ask.permission)).toEqual(["bash"])
+    expect(otherDevice.asks[0]).toMatchObject({ permission: "external_directory", patterns: ["/dev/*"] })
+  })
+
   test("isolates remote bash approvals from local execution and other targets", async () => {
     const command = "git log --oneline"
     const local = mockContext(tempDir())
