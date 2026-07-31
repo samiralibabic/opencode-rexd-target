@@ -19,7 +19,7 @@ import { buildBashPermissionRequest } from "./bash-permission"
 const TARGETS_PATH = resolve(homedir(), ".config/rexd/targets.json")
 const SESSION_STATE_ROOT = resolve(homedir(), ".config/opencode/rexd-target/sessions")
 const SESSION_STATE_TTL_MS = 1000 * 60 * 60 * 24 * 90
-const CLIENT_VERSION = "0.3.8"
+const CLIENT_VERSION = "0.3.9"
 const DEFAULT_READ_LIMIT = 2000
 const SAMPLE_BYTES = 4096
 const EXEC_OUTPUT_MAX_BYTES = 1024 * 1024
@@ -472,13 +472,13 @@ function localPermissionRoot(context: ToolContext): string {
 }
 
 function localExternalPattern(path: string, kind: "file" | "directory"): string {
-  const dir = kind === "directory" ? path : dirname(path)
-  return resolve(dir, "*").replaceAll("\\", "/")
+  if (kind === "file") return path.replaceAll("\\", "/")
+  return resolve(path, "*").replaceAll("\\", "/")
 }
 
 function remoteExternalPattern(path: string, kind: "file" | "directory"): string {
-  const dir = kind === "directory" ? path : posix.dirname(path)
-  return posix.join(dir, "*")
+  if (kind === "file") return path
+  return posix.join(path, "*")
 }
 
 function throwIfAborted(signal: AbortSignal): void {
@@ -672,7 +672,6 @@ export async function askBashPermission(
     }
     for (const path of shellPaths(command, cwd, true)) {
       const normalized = normalizeRemotePath(path)
-      if (normalized === "/dev/null") continue
       if (roots.some((root) => inRoot(normalized, root))) continue
       const pattern = remoteExternalPattern(normalized, "file")
       const scoped = remotePermissionPattern(remote.target, pattern)
@@ -690,7 +689,6 @@ export async function askBashPermission(
 
   if (!remote) {
     for (const path of shellPaths(command, cwd, false)) {
-      if (path === "/dev/null") continue
       if (localPathInProject(context, path)) continue
       const pattern = localExternalPattern(path, "file")
       await askPermission(context, "external_directory", [pattern], [pattern], { command, filepath: path })

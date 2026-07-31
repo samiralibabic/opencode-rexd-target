@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.3.9 - 2026-07-31
+
+- Request exact `external_directory` permission for external files instead of widening access to their parent directory.
+- Keep directory reads, searches, and working directories scoped to their actual contents.
+- Remove the `v0.3.8` `/dev/null` permission bypass so OpenCode configuration remains authoritative.
+
 ## v0.3.8 - 2026-07-31
 
 - Treat the exact local or remote `/dev/null` shell path as harmless without allowing other `/dev` entries.

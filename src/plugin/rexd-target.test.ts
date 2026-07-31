@@ -180,7 +180,7 @@ describe("permissions and capabilities", () => {
     await askLocalPathPermission(context as any, "read", join(external, "file.txt"))
 
     expect(asks.map((ask) => ask.permission)).toEqual(["external_directory", "read"])
-    expect(asks[0].patterns[0]).toBe(`${external}/*`)
+    expect(asks[0].patterns[0]).toBe(join(external, "file.txt"))
   })
 
   test("uses canonical remote paths without comparing them to the local worktree", async () => {
@@ -195,8 +195,26 @@ describe("permissions and capabilities", () => {
 
     const scope = remotePermissionScope("prod")
     expect(asks.map((ask) => ask.permission)).toEqual(["external_directory", "read"])
-    expect(asks[0].patterns).toEqual([`${scope}/srv/secrets/*`])
+    expect(asks[0].patterns).toEqual([`${scope}/srv/secrets/token`])
     expect(asks[1].patterns).toEqual([`${scope}/srv/secrets/token`])
+  })
+
+  test("keeps directory-wide external permissions scoped to directory contents", async () => {
+    const external = tempDir()
+    const local = mockContext(tempDir())
+    const remote = mockContext(tempDir())
+
+    await askLocalPathPermission(local.context as any, "read", external, {}, "directory")
+    await askRemotePathPermission(remote.context as any, {
+      permission: "read",
+      path: "/srv/secrets",
+      workspaceRoots: ["/srv/app"],
+      target: "prod",
+      kind: "directory",
+    })
+
+    expect(local.asks[0].patterns).toEqual([`${external}/*`])
+    expect(remote.asks[0].patterns).toEqual([`${remotePermissionScope("prod")}/srv/secrets/*`])
   })
 
   test("treats OpenCode's root worktree sentinel as outside the project directory", async () => {
@@ -275,7 +293,7 @@ describe("permissions and capabilities", () => {
     expect(asks[0]).toMatchObject({ permission: "external_directory", patterns: [`${scope}*`] })
   })
 
-  test("does not ask external-directory permission for /dev/null", async () => {
+  test("requests exact external files found in local and remote shell commands", async () => {
     const command = "command -v git > /dev/null"
     const local = mockContext(tempDir())
     const remote = mockContext(tempDir())
@@ -288,9 +306,12 @@ describe("permissions and capabilities", () => {
     })
     await askBashPermission(otherDevice.context as any, "command -v git > /dev/tty", otherDevice.context.directory)
 
-    expect(local.asks.map((ask) => ask.permission)).toEqual(["bash"])
-    expect(remote.asks.map((ask) => ask.permission)).toEqual(["bash"])
-    expect(otherDevice.asks[0]).toMatchObject({ permission: "external_directory", patterns: ["/dev/*"] })
+    expect(local.asks[0]).toMatchObject({ permission: "external_directory", patterns: ["/dev/null"] })
+    expect(remote.asks[0]).toMatchObject({
+      permission: "external_directory",
+      patterns: [`${remotePermissionScope("deploy")}/dev/null`],
+    })
+    expect(otherDevice.asks[0]).toMatchObject({ permission: "external_directory", patterns: ["/dev/tty"] })
   })
 
   test("isolates remote bash approvals from local execution and other targets", async () => {

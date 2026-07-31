@@ -1,6 +1,6 @@
 {
   "name": "opencode-rexd-target",
-  "version": "0.3.8",
+  "version": "0.3.9",
   "description": "REXD Target Plugin for OpenCode - transparent remote machine access",
   "main": "dist/index.js",
   "exports": {
