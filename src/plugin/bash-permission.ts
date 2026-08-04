@@ -17,6 +17,20 @@ export type PosixCommandParse = {
   unsupported: boolean
 }
 
+/** A filesystem operand from a supported POSIX simple command. */
+export type ShellPathCandidate = {
+  /** Original token, retained to distinguish shell expansion from quoted text. */
+  raw: string
+  /** Token with POSIX quotes and escapes removed, without performing expansion. */
+  value: string
+}
+
+export type PosixShellPathScan = {
+  candidates: ShellPathCandidate[]
+  /** True when this deliberately small parser cannot safely model the input. */
+  unsupported: boolean
+}
+
 export type BashPermissionOptions = {
   /**
    * A caller-owned prefix that namespaces every generated rule, for example
@@ -63,6 +77,11 @@ const SHELL_KEYWORDS = new Set([
   "until",
   "while",
 ])
+
+// Keep this aligned with OpenCode's POSIX FILES set in tool/shell.ts. `find`
+// is intentionally limited to its root operands below, rather than treating
+// its query expressions as paths.
+const FILE_COMMANDS = new Set([...CWD_ONLY_COMMANDS, "rm", "cp", "mv", "mkdir", "touch", "chmod", "chown", "cat"])
 
 function unique(values: readonly string[]): string[] {
   return [...new Set(values)]
@@ -148,7 +167,12 @@ function splitTopLevel(command: string): TopLevelScan {
     if (char === "`" || (char === "$" && command[index + 1] === "(") || "(){}".includes(char)) {
       return { sources: [], unsupported: true }
     }
-    if (char === "#" && isCommentStart(command, index)) return { sources: [], unsupported: true }
+    if (char === "#" && isCommentStart(command, index)) {
+      const newline = command.indexOf("\n", index + 1)
+      if (newline === -1) break
+      index = newline - 1
+      continue
+    }
 
     // Here-documents and Bash-only force-redirection cannot be represented by
     // this simple scanner. Ordinary <, >, >>, <>, <&, and >& are retained in
@@ -324,6 +348,94 @@ function commandTokens(source: string): { tokens: string[]; unsupported: boolean
     tokens.push(item.raw)
   }
   return redirectionOperand ? { tokens: [], unsupported: true } : { tokens, unsupported: false }
+}
+
+function isAssignment(item: Extract<LexItem, { kind: "word" }>): boolean {
+  return /^[A-Za-z_][A-Za-z0-9_]*=.*/.test(item.raw)
+}
+
+function isDescriptorDuplication(redirection: string, operand: string): boolean {
+  return (redirection.endsWith("&") && (/^\d+$/.test(operand) || operand === "-"))
+}
+
+function pathArguments(command: string, words: Array<Extract<LexItem, { kind: "word" }>>): ShellPathCandidate[] {
+  return words
+    .filter((word) => !word.raw.startsWith("-") && !(command === "chmod" && word.raw.startsWith("+")))
+    .map(({ raw, value }) => ({ raw, value }))
+}
+
+function findRootArguments(words: Array<Extract<LexItem, { kind: "word" }>>): ShellPathCandidate[] {
+  const roots: ShellPathCandidate[] = []
+  let options = true
+  let optionOperand = false
+
+  for (const word of words) {
+    if (options && optionOperand) {
+      optionOperand = false
+      continue
+    }
+    if (options && word.value === "--") {
+      options = false
+      continue
+    }
+    if (options && (word.value === "-H" || word.value === "-L" || word.value === "-P" || word.value.startsWith("-O"))) continue
+    if (options && word.value === "-D") {
+      optionOperand = true
+      continue
+    }
+    if (word.value.startsWith("-") || word.value === "!" || word.value === "(" || word.value === ")") break
+    options = false
+    roots.push({ raw: word.raw, value: word.value })
+  }
+  return roots
+}
+
+/**
+ * Finds filesystem operands using only the POSIX grammar this module can
+ * model. Callers must retain a conservative fallback when `unsupported` is
+ * true, because nested or shell-specific grammar has not been inspected.
+ */
+export function scanPosixShellPaths(command: string): PosixShellPathScan {
+  const split = splitTopLevel(command)
+  if (split.unsupported) return { candidates: [], unsupported: true }
+
+  const candidates: ShellPathCandidate[] = []
+  for (const source of split.sources) {
+    const lexed = lexSimple(source)
+    if (lexed.unsupported) return { candidates: [], unsupported: true }
+
+    const words: Array<Extract<LexItem, { kind: "word" }>> = []
+    for (let index = 0; index < lexed.items.length; index++) {
+      const item = lexed.items[index]
+      if (item.kind !== "redirection") {
+        words.push(item)
+        continue
+      }
+      const operand = lexed.items[index + 1]
+      if (!operand || operand.kind !== "word") return { candidates: [], unsupported: true }
+      if (!isDescriptorDuplication(item.raw, operand.value)) candidates.push({ raw: operand.raw, value: operand.value })
+      index++
+    }
+
+    let commandWord: Extract<LexItem, { kind: "word" }> | undefined
+    const arguments_: Array<Extract<LexItem, { kind: "word" }>> = []
+    for (const word of words) {
+      if (!commandWord) {
+        if (isAssignment(word)) continue
+        commandWord = word
+        continue
+      }
+      arguments_.push(word)
+    }
+    // Redirection-only and assignment-only commands are valid and can still
+    // create or truncate their already-collected targets.
+    if (!commandWord) continue
+    if (SHELL_KEYWORDS.has(commandWord.value)) return { candidates: [], unsupported: true }
+
+    if (FILE_COMMANDS.has(commandWord.value)) candidates.push(...pathArguments(commandWord.value, arguments_))
+    else if (commandWord.value === "find") candidates.push(...findRootArguments(arguments_))
+  }
+  return { candidates: [...new Map(candidates.map((candidate) => [`${candidate.raw}\0${candidate.value}`, candidate])).values()], unsupported: false }
 }
 
 /**

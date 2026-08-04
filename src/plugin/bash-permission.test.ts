@@ -4,6 +4,7 @@ import {
   bashPermissionGuard,
   buildBashPermissionRequest,
   parsePosixShellCommands,
+  scanPosixShellPaths,
 } from "./bash-permission"
 
 // Mirrors OpenCode 1.18.4's anchored wildcard semantics for approval-boundary tests.
@@ -61,6 +62,17 @@ describe("bash permission request builder", () => {
     expect(request.always).toEqual(["echo *", "git log *"])
   })
 
+  test("ignores shell comments without discarding surrounding commands", () => {
+    const request = buildBashPermissionRequest("git status # /outside/is/comment-data\ngit diff")
+
+    expect(request.unsupported).toBe(false)
+    expect(request.patterns).toEqual(["git status", "git diff"])
+    expect(scanPosixShellPaths("rg /api/foo frontend # /outside/is/comment-data")).toEqual({
+      unsupported: false,
+      candidates: [],
+    })
+  })
+
   test("fails closed for active command substitutions inside double quotes", () => {
     for (const command of ['echo "$(rm -rf build)"', 'cd "$(rm -rf build)"', 'X="$(dangerous-command)"', 'echo "`id`"']) {
       const request = buildBashPermissionRequest(command)
@@ -88,6 +100,23 @@ describe("bash permission request builder", () => {
     })
     expect(request.patterns).toEqual([command])
     expect(request.always).toEqual(["git log *"])
+  })
+
+  test("collects only filesystem operands, find roots, and real redirection targets", () => {
+    expect(scanPosixShellPaths("cat -n /etc/hosts && find .. -name '/api/foo' && echo ok > /dev/null && echo ok>/dev/tty && >/tmp/redirection-only && echo 2>&1")).toEqual({
+      unsupported: false,
+      candidates: [
+        { raw: "/etc/hosts", value: "/etc/hosts" },
+        { raw: "..", value: ".." },
+        { raw: "/dev/null", value: "/dev/null" },
+        { raw: "/dev/tty", value: "/dev/tty" },
+        { raw: "/tmp/redirection-only", value: "/tmp/redirection-only" },
+      ],
+    })
+    expect(scanPosixShellPaths(`rg '"/sitemap.xml"' frontend && grep "/api/foo" file.ts && curl https://example.com/api/foo`)).toEqual({
+      unsupported: false,
+      candidates: [],
+    })
   })
 
   test("excludes cwd-only commands while retaining later commands", () => {

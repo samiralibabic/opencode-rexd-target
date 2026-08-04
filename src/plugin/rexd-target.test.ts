@@ -314,6 +314,61 @@ describe("permissions and capabilities", () => {
     expect(otherDevice.asks[0]).toMatchObject({ permission: "external_directory", patterns: ["/dev/tty"] })
   })
 
+  test("scans filesystem operands and redirection targets without treating search and route data as paths", async () => {
+    const directory = tempDir()
+    const worktree = join(directory, "worktree")
+    mkdirSync(worktree)
+
+    for (const command of [
+      `rg '"/sitemap.xml"' frontend`,
+      'grep "/api/foo" file.ts',
+      "curl https://example.com/api/foo",
+      "echo ok 2>&1",
+      "read value <<</route/data",
+    ]) {
+      const { context, asks } = mockContext(worktree)
+      await askBashPermission(context as any, command, worktree)
+      expect(asks.map((ask) => ask.permission)).toEqual(["bash"])
+    }
+
+    for (const [command, expected] of [
+      ["cat /etc/hosts", "/etc/hosts"],
+      ["find .. -name package.json", directory],
+      ["echo ok > /etc/output", "/etc/output"],
+      ["echo ok>/etc/unspaced-output", "/etc/unspaced-output"],
+      [">/etc/redirection-only", "/etc/redirection-only"],
+      ["echo ok &>/etc/unsupported-redirection", "/etc/unsupported-redirection"],
+    ]) {
+      const { context, asks } = mockContext(worktree)
+      await askBashPermission(context as any, command, worktree)
+      expect(asks[0]).toMatchObject({ permission: "external_directory", patterns: [expected] })
+    }
+  })
+
+  test("expands only shell-active home expressions in filesystem operands", async () => {
+    const directory = tempDir()
+
+    for (const command of ["cat '~/secret'", "cat \\~/secret", "cat '$HOME/secret'", "cat \\$HOME/secret"]) {
+      const { context, asks } = mockContext(directory)
+      await askBashPermission(context as any, command, directory)
+      expect(asks.map((ask) => ask.permission)).toEqual(["bash"])
+    }
+
+    const { context, asks } = mockContext(directory)
+    await askBashPermission(context as any, 'cat "$HOME/secret"', directory)
+    expect(asks[0].permission).toBe("external_directory")
+  })
+
+  test("keeps external-path checks conservative for unsupported shell grammar", async () => {
+    const directory = tempDir()
+    const { context, asks } = mockContext(directory)
+
+    await askBashPermission(context as any, 'echo "$(cat /etc/hosts)"', directory)
+
+    expect(asks[0]).toMatchObject({ permission: "external_directory", patterns: ["/etc/hosts"] })
+    expect(asks[1].permission).toBe("bash")
+  })
+
   test("isolates remote bash approvals from local execution and other targets", async () => {
     const command = "git log --oneline"
     const local = mockContext(tempDir())
