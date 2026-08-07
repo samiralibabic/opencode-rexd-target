@@ -63,9 +63,27 @@ fi
 tar -xzf "${TMP_DIR}/${ASSET}" -C "${TMP_DIR}"
 
 PLUGIN_SRC="${TMP_DIR}/plugins/rexd-target.js"
+TREE_SITTER_SRC="${TMP_DIR}/plugins/rexd-target-tree-sitter.wasm"
+BASH_GRAMMAR_SRC="${TMP_DIR}/plugins/rexd-target-tree-sitter-bash.wasm"
 COMMAND_SRC="${TMP_DIR}/commands/target.md"
 if [[ ! -f "${PLUGIN_SRC}" ]]; then
   echo "Missing plugin payload: ${PLUGIN_SRC}" >&2
+  exit 1
+fi
+PARSER_REQUIRED=false
+if grep -q 'rexd-target-tree-sitter\.wasm' "${PLUGIN_SRC}"; then
+  PARSER_REQUIRED=true
+fi
+if [[ "${PARSER_REQUIRED}" == true && ! -f "${TREE_SITTER_SRC}" ]]; then
+  echo "Missing plugin payload: ${TREE_SITTER_SRC}" >&2
+  exit 1
+fi
+if [[ "${PARSER_REQUIRED}" == true && ! -f "${BASH_GRAMMAR_SRC}" ]]; then
+  echo "Missing plugin payload: ${BASH_GRAMMAR_SRC}" >&2
+  exit 1
+fi
+if [[ "${PARSER_REQUIRED}" == false ]] && { [[ -f "${TREE_SITTER_SRC}" && ! -f "${BASH_GRAMMAR_SRC}" ]] || [[ ! -f "${TREE_SITTER_SRC}" && -f "${BASH_GRAMMAR_SRC}" ]]; }; then
+  echo "Incomplete parser payload in ${ASSET}." >&2
   exit 1
 fi
 if [[ ! -f "${COMMAND_SRC}" ]]; then
@@ -75,9 +93,17 @@ fi
 
 mkdir -p "${CONFIG_DIR}/plugins" "${CONFIG_DIR}/commands"
 install -m 0644 "${PLUGIN_SRC}" "${CONFIG_DIR}/plugins/rexd-target.js"
+if [[ -f "${TREE_SITTER_SRC}" ]]; then
+  install -m 0644 "${TREE_SITTER_SRC}" "${CONFIG_DIR}/plugins/rexd-target-tree-sitter.wasm"
+  install -m 0644 "${BASH_GRAMMAR_SRC}" "${CONFIG_DIR}/plugins/rexd-target-tree-sitter-bash.wasm"
+fi
 install -m 0644 "${COMMAND_SRC}" "${CONFIG_DIR}/commands/target.md"
 
 echo "Installed plugin: ${CONFIG_DIR}/plugins/rexd-target.js"
+if [[ -f "${TREE_SITTER_SRC}" ]]; then
+  echo "Installed parser: ${CONFIG_DIR}/plugins/rexd-target-tree-sitter.wasm"
+  echo "Installed grammar: ${CONFIG_DIR}/plugins/rexd-target-tree-sitter-bash.wasm"
+fi
 echo "Installed command: ${CONFIG_DIR}/commands/target.md"
 
 echo

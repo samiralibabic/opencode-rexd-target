@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.3.10 - 2026-08-07
+
+- Parse Bash path operands with `tree-sitter-bash` and OpenCode's command-based filesystem classification instead of scanning unsupported command text with a broad path regex.
+- Stop regexes, URLs, routes, and other slash-prefixed command data from causing false `external_directory` prompts in compound Bash syntax.
+- Preserve RexD's target-scoped remote permissions, `find` root checks, and real redirection checks while matching OpenCode's handling of dynamic operands and glob prefixes.
+- Ship namespaced Tree-sitter runtime and Bash grammar assets with the plugin installer and release archive.
+
 ## v0.3.9 - 2026-07-31
 
 - Request exact `external_directory` permission for external files instead of widening access to their parent directory.

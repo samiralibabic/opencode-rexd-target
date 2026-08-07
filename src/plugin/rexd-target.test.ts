@@ -261,11 +261,11 @@ describe("permissions and capabilities", () => {
     }
   })
 
-  test("asks external-directory permission for relative and home shell paths", async () => {
+  test("asks external-directory permission for relative and tilde shell paths", async () => {
     const directory = tempDir()
     const plugin = await RexdTargetPlugin(mockPluginInput(directory))
 
-    for (const command of ["cat ../secret", "cat ~/secret", "cat $HOME/secret", "cat ${HOME}/secret"]) {
+    for (const command of ["cat ../secret", "cat ~/secret"]) {
       const { context, asks } = mockContext(directory)
       context.ask = async (input: any) => {
         asks.push(input)
@@ -345,21 +345,69 @@ describe("permissions and capabilities", () => {
     }
   })
 
-  test("expands only shell-active home expressions in filesystem operands", async () => {
+  test("does not treat awk expressions in compound Bash commands as paths", async () => {
+    const command = `for u in https://example.com/a https://example.com/b; do
+  curl -sI "$u" | awk 'NR==1 || /^content-type:|^content-length:|^location:/'
+done`
+    const local = mockContext(tempDir())
+    const remote = mockContext(tempDir())
+
+    await askBashPermission(local.context as any, command, local.context.directory)
+    await askBashPermission(remote.context as any, command, "/srv/app", {
+      target: "deploy",
+      workspaceRoots: ["/srv/app"],
+    })
+
+    expect(local.asks.map((ask) => ask.permission)).toEqual(["bash"])
+    expect(remote.asks.map((ask) => ask.permission)).toEqual(["bash"])
+    expect(remote.asks[0].patterns.every((pattern: string) => pattern.startsWith(remotePermissionScope("deploy")))).toBe(true)
+  })
+
+  test("checks the static prefix before normalizing a glob path", async () => {
+    const local = mockContext(tempDir())
+    const remote = mockContext(tempDir())
+
+    await askBashPermission(local.context as any, "cat /tmp/*/../../srv/app/file", local.context.directory)
+    await askBashPermission(remote.context as any, "cat /tmp/*/../../srv/app/file", "/srv/app", {
+      target: "deploy",
+      workspaceRoots: ["/srv/app"],
+    })
+
+    expect(local.asks[0]).toMatchObject({
+      permission: "external_directory",
+      patterns: ["/tmp/*"],
+      metadata: { filepath: "/tmp" },
+    })
+    expect(remote.asks[0]).toMatchObject({
+      permission: "external_directory",
+      patterns: [`${remotePermissionScope("deploy")}/tmp/*`],
+      metadata: { filepath: "/tmp", remote: true, target: "deploy" },
+    })
+
+    const basenameGlob = mockContext(tempDir())
+    await askBashPermission(basenameGlob.context as any, "cat /tmp/foo*.txt", basenameGlob.context.directory)
+    expect(basenameGlob.asks[0]).toMatchObject({ permission: "external_directory", patterns: ["/tmp/*"] })
+  })
+
+  test("preserves quoted literals and skips dynamic path operands like OpenCode", async () => {
     const directory = tempDir()
 
-    for (const command of ["cat '~/secret'", "cat \\~/secret", "cat '$HOME/secret'", "cat \\$HOME/secret"]) {
+    for (const command of [
+      "cat '~/secret'",
+      "cat \\~/secret",
+      "cat '$HOME/secret'",
+      "cat \\$HOME/secret",
+      "cat $HOME/secret",
+      "cat ${HOME}/secret",
+      'cat "$HOME/secret"',
+    ]) {
       const { context, asks } = mockContext(directory)
       await askBashPermission(context as any, command, directory)
       expect(asks.map((ask) => ask.permission)).toEqual(["bash"])
     }
-
-    const { context, asks } = mockContext(directory)
-    await askBashPermission(context as any, 'cat "$HOME/secret"', directory)
-    expect(asks[0].permission).toBe("external_directory")
   })
 
-  test("keeps external-path checks conservative for unsupported shell grammar", async () => {
+  test("finds static paths in nested command substitutions", async () => {
     const directory = tempDir()
     const { context, asks } = mockContext(directory)
 

@@ -1,4 +1,9 @@
 import { createHash } from "node:crypto"
+import { isAbsolute, posix } from "node:path"
+import { fileURLToPath } from "node:url"
+import { Language, Parser, type Node } from "web-tree-sitter"
+import bashWasm from "tree-sitter-bash/tree-sitter-bash.wasm" with { type: "file" }
+import treeSitterWasm from "web-tree-sitter/tree-sitter.wasm" with { type: "file" }
 
 /** Commands which only change the shell's current directory. */
 export const CWD_ONLY_COMMANDS = new Set(["cd", "chdir", "popd", "pushd", "push-location", "set-location"])
@@ -17,17 +22,19 @@ export type PosixCommandParse = {
   unsupported: boolean
 }
 
-/** A filesystem operand from a supported POSIX simple command. */
+/** A filesystem operand from a statically classifiable Bash command argument. */
 export type ShellPathCandidate = {
   /** Original token, retained to distinguish shell expansion from quoted text. */
   raw: string
-  /** Token with POSIX quotes and escapes removed, without performing expansion. */
+  /** Static path, or the directory containing the first glob component. */
   value: string
+  /** A glob prefix denotes the directory the shell must enumerate. */
+  directory?: true
 }
 
-export type PosixShellPathScan = {
+export type BashShellPathScan = {
   candidates: ShellPathCandidate[]
-  /** True when this deliberately small parser cannot safely model the input. */
+  /** Reserved for callers which need to distinguish future parser failures. */
   unsupported: boolean
 }
 
@@ -59,6 +66,11 @@ type TopLevelScan = {
   unsupported: boolean
 }
 
+type BashPart = {
+  type: string
+  text: string
+}
+
 const SHELL_KEYWORDS = new Set([
   "!",
   "case",
@@ -78,13 +90,102 @@ const SHELL_KEYWORDS = new Set([
   "while",
 ])
 
-// Keep this aligned with OpenCode's POSIX FILES set in tool/shell.ts. `find`
-// is intentionally limited to its root operands below, rather than treating
-// its query expressions as paths.
+// Keep this aligned with OpenCode's FILES set in packages/opencode/src/tool/shell.ts.
+// `find` remains a documented RexD extension limited to root operands below.
 const FILE_COMMANDS = new Set([...CWD_ONLY_COMMANDS, "rm", "cp", "mv", "mkdir", "touch", "chmod", "chown", "cat"])
 
 function unique(values: readonly string[]): string[] {
   return [...new Set(values)]
+}
+
+function resolveWasm(asset: string): string {
+  if (asset.startsWith("file://")) return fileURLToPath(asset)
+  if (isAbsolute(asset) || /^[a-z]:/i.test(asset)) return asset
+  return fileURLToPath(new URL(asset, import.meta.url))
+}
+
+let bashParserPromise: Promise<Parser> | undefined
+
+function bashParser(): Promise<Parser> {
+  if (bashParserPromise) return bashParserPromise
+  bashParserPromise = (async () => {
+    await Parser.init({
+      locateFile() {
+        return resolveWasm(treeSitterWasm)
+      },
+    })
+    const language = await Language.load(resolveWasm(bashWasm))
+    const parser = new Parser()
+    parser.setLanguage(language)
+    return parser
+  })()
+  return bashParserPromise
+}
+
+/*
+ * AST traversal and static path filtering follow OpenCode upstream at
+ * packages/opencode/src/tool/shell.ts (284214c78d32a09fd9c729bdefc07be50f74eb40).
+ */
+function bashCommandParts(node: Node): BashPart[] {
+  const parts: BashPart[] = []
+  for (let index = 0; index < node.childCount; index++) {
+    const child = node.child(index)
+    if (!child) continue
+    if (child.type === "command_elements") {
+      for (let partIndex = 0; partIndex < child.childCount; partIndex++) {
+        const part = child.child(partIndex)
+        if (!part || part.type === "command_argument_sep" || part.type === "redirection") continue
+        parts.push({ type: part.type, text: part.text })
+      }
+      continue
+    }
+    if (
+      child.type !== "command_name" &&
+      child.type !== "command_name_expr" &&
+      child.type !== "word" &&
+      child.type !== "string" &&
+      child.type !== "raw_string" &&
+      child.type !== "concatenation"
+    ) {
+      continue
+    }
+    parts.push({ type: child.type, text: child.text })
+  }
+  return parts
+}
+
+function unquote(text: string): string {
+  if (text.length < 2) return text
+  const first = text[0]
+  const last = text[text.length - 1]
+  if ((first === '"' || first === "'") && first === last) return text.slice(1, -1)
+  return text
+}
+
+function staticPathPrefix(text: string): string | undefined {
+  const match = /[?*[]/.exec(text)
+  if (!match) return text
+  if (match.index === 0) return
+  return text.slice(0, match.index)
+}
+
+function dynamicPath(text: string): boolean {
+  if (text.startsWith("(") || text.startsWith("@(")) return true
+  if (text.includes("$(") || text.includes("${") || text.includes("`")) return true
+  return text.includes("$")
+}
+
+function globDirectoryPrefix(prefix: string): string {
+  if (prefix.endsWith("/")) return prefix.replace(/\/+$/, "") || "/"
+  return posix.dirname(prefix)
+}
+
+function staticPathCandidate(part: BashPart): ShellPathCandidate | undefined {
+  const value = unquote(part.text)
+  const prefix = staticPathPrefix(value)
+  if (!prefix || dynamicPath(prefix)) return
+  if (prefix === value) return { raw: part.text, value }
+  return { raw: part.text, value: globDirectoryPrefix(prefix), directory: true }
 }
 
 function isCommentStart(input: string, index: number): boolean {
@@ -350,92 +451,83 @@ function commandTokens(source: string): { tokens: string[]; unsupported: boolean
   return redirectionOperand ? { tokens: [], unsupported: true } : { tokens, unsupported: false }
 }
 
-function isAssignment(item: Extract<LexItem, { kind: "word" }>): boolean {
-  return /^[A-Za-z_][A-Za-z0-9_]*=.*/.test(item.raw)
+function pathArguments(command: string, parts: BashPart[]): ShellPathCandidate[] {
+  return parts
+    .filter((part) => !part.text.startsWith("-") && !(command === "chmod" && part.text.startsWith("+")))
+    .map(staticPathCandidate)
+    .filter((candidate): candidate is ShellPathCandidate => Boolean(candidate))
 }
 
-function isDescriptorDuplication(redirection: string, operand: string): boolean {
-  return (redirection.endsWith("&") && (/^\d+$/.test(operand) || operand === "-"))
-}
-
-function pathArguments(command: string, words: Array<Extract<LexItem, { kind: "word" }>>): ShellPathCandidate[] {
-  return words
-    .filter((word) => !word.raw.startsWith("-") && !(command === "chmod" && word.raw.startsWith("+")))
-    .map(({ raw, value }) => ({ raw, value }))
-}
-
-function findRootArguments(words: Array<Extract<LexItem, { kind: "word" }>>): ShellPathCandidate[] {
+function findRootArguments(parts: BashPart[]): ShellPathCandidate[] {
   const roots: ShellPathCandidate[] = []
   let options = true
   let optionOperand = false
 
-  for (const word of words) {
+  for (const part of parts) {
+    const value = unquote(part.text)
     if (options && optionOperand) {
       optionOperand = false
       continue
     }
-    if (options && word.value === "--") {
+    if (options && value === "--") {
       options = false
       continue
     }
-    if (options && (word.value === "-H" || word.value === "-L" || word.value === "-P" || word.value.startsWith("-O"))) continue
-    if (options && word.value === "-D") {
+    if (options && (value === "-H" || value === "-L" || value === "-P" || value.startsWith("-O"))) continue
+    if (options && value === "-D") {
       optionOperand = true
       continue
     }
-    if (word.value.startsWith("-") || word.value === "!" || word.value === "(" || word.value === ")") break
+    if (value.startsWith("-") || value === "!" || value === "(" || value === ")") break
     options = false
-    roots.push({ raw: word.raw, value: word.value })
+    const candidate = staticPathCandidate(part)
+    if (candidate) roots.push(candidate)
   }
   return roots
 }
 
 /**
- * Finds filesystem operands using only the POSIX grammar this module can
- * model. Callers must retain a conservative fallback when `unsupported` is
- * true, because nested or shell-specific grammar has not been inspected.
+ * Finds filesystem operands by walking the same Bash command nodes and static
+ * arguments as OpenCode. RexD additionally retains find roots and actual file
+ * redirection destinations, which its local/remote boundary checks require.
  */
-export function scanPosixShellPaths(command: string): PosixShellPathScan {
-  const split = splitTopLevel(command)
-  if (split.unsupported) return { candidates: [], unsupported: true }
+export async function scanBashShellPaths(command: string): Promise<BashShellPathScan> {
+  const parser = await bashParser()
+  const tree = parser.parse(command)
+  if (!tree) throw new Error("Failed to parse Bash command")
 
-  const candidates: ShellPathCandidate[] = []
-  for (const source of split.sources) {
-    const lexed = lexSimple(source)
-    if (lexed.unsupported) return { candidates: [], unsupported: true }
-
-    const words: Array<Extract<LexItem, { kind: "word" }>> = []
-    for (let index = 0; index < lexed.items.length; index++) {
-      const item = lexed.items[index]
-      if (item.kind !== "redirection") {
-        words.push(item)
-        continue
-      }
-      const operand = lexed.items[index + 1]
-      if (!operand || operand.kind !== "word") return { candidates: [], unsupported: true }
-      if (!isDescriptorDuplication(item.raw, operand.value)) candidates.push({ raw: operand.raw, value: operand.value })
-      index++
+  try {
+    const candidates: ShellPathCandidate[] = []
+    for (const node of tree.rootNode.descendantsOfType("command")) {
+      const parts = bashCommandParts(node)
+      const commandName = parts[0]?.text
+      if (!commandName) continue
+      const arguments_ = parts.slice(1)
+      if (FILE_COMMANDS.has(commandName)) candidates.push(...pathArguments(commandName, arguments_))
+      else if (commandName === "find") candidates.push(...findRootArguments(arguments_))
     }
 
-    let commandWord: Extract<LexItem, { kind: "word" }> | undefined
-    const arguments_: Array<Extract<LexItem, { kind: "word" }>> = []
-    for (const word of words) {
-      if (!commandWord) {
-        if (isAssignment(word)) continue
-        commandWord = word
-        continue
-      }
-      arguments_.push(word)
+    // OpenCode currently omits redirect destinations from path classification.
+    // RexD intentionally keeps them because both local and remote execution can
+    // write outside the selected workspace before the command itself starts.
+    for (const redirect of tree.rootNode.descendantsOfType("file_redirect")) {
+      const destination = redirect.childForFieldName("destination")
+      if (!destination || destination.type === "number" || destination.text === "-") continue
+      const candidate = staticPathCandidate({ type: destination.type, text: destination.text })
+      if (candidate) candidates.push(candidate)
     }
-    // Redirection-only and assignment-only commands are valid and can still
-    // create or truncate their already-collected targets.
-    if (!commandWord) continue
-    if (SHELL_KEYWORDS.has(commandWord.value)) return { candidates: [], unsupported: true }
 
-    if (FILE_COMMANDS.has(commandWord.value)) candidates.push(...pathArguments(commandWord.value, arguments_))
-    else if (commandWord.value === "find") candidates.push(...findRootArguments(arguments_))
+    return {
+      candidates: [
+        ...new Map(
+          candidates.map((candidate) => [`${candidate.raw}\0${candidate.value}\0${candidate.directory ? "directory" : "file"}`, candidate]),
+        ).values(),
+      ],
+      unsupported: false,
+    }
+  } finally {
+    tree.delete()
   }
-  return { candidates: [...new Map(candidates.map((candidate) => [`${candidate.raw}\0${candidate.value}`, candidate])).values()], unsupported: false }
 }
 
 /**

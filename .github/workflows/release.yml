@@ -34,6 +34,7 @@ jobs:
         run: |
           mkdir -p release/plugins release/commands
           cp dist/index.js release/plugins/rexd-target.js
+          cp dist/rexd-target-tree-sitter.wasm dist/rexd-target-tree-sitter-bash.wasm release/plugins/
           cp .opencode/commands/target.md release/commands/target.md
           tar -C release -czf release/opencode-rexd-target.tar.gz plugins commands
 

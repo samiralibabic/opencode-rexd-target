@@ -4,7 +4,7 @@ import {
   bashPermissionGuard,
   buildBashPermissionRequest,
   parsePosixShellCommands,
-  scanPosixShellPaths,
+  scanBashShellPaths,
 } from "./bash-permission"
 
 // Mirrors OpenCode 1.18.4's anchored wildcard semantics for approval-boundary tests.
@@ -62,12 +62,12 @@ describe("bash permission request builder", () => {
     expect(request.always).toEqual(["echo *", "git log *"])
   })
 
-  test("ignores shell comments without discarding surrounding commands", () => {
+  test("ignores shell comments without discarding surrounding commands", async () => {
     const request = buildBashPermissionRequest("git status # /outside/is/comment-data\ngit diff")
 
     expect(request.unsupported).toBe(false)
     expect(request.patterns).toEqual(["git status", "git diff"])
-    expect(scanPosixShellPaths("rg /api/foo frontend # /outside/is/comment-data")).toEqual({
+    expect(await scanBashShellPaths("rg /api/foo frontend # /outside/is/comment-data")).toEqual({
       unsupported: false,
       candidates: [],
     })
@@ -102,8 +102,8 @@ describe("bash permission request builder", () => {
     expect(request.always).toEqual(["git log *"])
   })
 
-  test("collects only filesystem operands, find roots, and real redirection targets", () => {
-    expect(scanPosixShellPaths("cat -n /etc/hosts && find .. -name '/api/foo' && echo ok > /dev/null && echo ok>/dev/tty && >/tmp/redirection-only && echo 2>&1")).toEqual({
+  test("collects only filesystem operands, find roots, and real redirection targets", async () => {
+    expect(await scanBashShellPaths("cat -n /etc/hosts && find .. -name '/api/foo' && echo ok > /dev/null && echo ok>/dev/tty && >/tmp/redirection-only && echo 2>&1")).toEqual({
       unsupported: false,
       candidates: [
         { raw: "/etc/hosts", value: "/etc/hosts" },
@@ -113,7 +113,32 @@ describe("bash permission request builder", () => {
         { raw: "/tmp/redirection-only", value: "/tmp/redirection-only" },
       ],
     })
-    expect(scanPosixShellPaths(`rg '"/sitemap.xml"' frontend && grep "/api/foo" file.ts && curl https://example.com/api/foo`)).toEqual({
+    expect(await scanBashShellPaths(`rg '"/sitemap.xml"' frontend && grep "/api/foo" file.ts && curl https://example.com/api/foo`)).toEqual({
+      unsupported: false,
+      candidates: [],
+    })
+  })
+
+  test("walks compound Bash commands without scanning their raw text", async () => {
+    const command = `for u in https://example.com/a https://example.com/b; do
+  curl -sI "$u" | awk 'NR==1 || /^content-type:|^content-length:|^location:/'
+done`
+
+    expect(await scanBashShellPaths(command)).toEqual({ unsupported: false, candidates: [] })
+    expect(await scanBashShellPaths("for n in 1 2; do cat /etc/hosts; done")).toEqual({
+      unsupported: false,
+      candidates: [{ raw: "/etc/hosts", value: "/etc/hosts" }],
+    })
+    expect(await scanBashShellPaths("cat /tmp/*/../../srv/app/file")).toEqual({
+      unsupported: false,
+      candidates: [{ raw: "/tmp/*/../../srv/app/file", value: "/tmp", directory: true }],
+    })
+    expect(await scanBashShellPaths("cat /tmp/foo*.txt")).toEqual({
+      unsupported: false,
+      candidates: [{ raw: "/tmp/foo*.txt", value: "/tmp", directory: true }],
+    })
+    // OpenCode does not infer the loop value flowing into the dynamic cat argument.
+    expect(await scanBashShellPaths('for f in /etc/*; do cat "$f"; done')).toEqual({
       unsupported: false,
       candidates: [],
     })

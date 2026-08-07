@@ -14,12 +14,12 @@ import { createHash, randomUUID } from "node:crypto"
 import { homedir } from "node:os"
 import { dirname, isAbsolute, posix, relative, resolve } from "node:path"
 import { createTwoFilesPatch } from "diff"
-import { buildBashPermissionRequest, scanPosixShellPaths, type ShellPathCandidate } from "./bash-permission"
+import { buildBashPermissionRequest, scanBashShellPaths, type ShellPathCandidate } from "./bash-permission"
 
 const TARGETS_PATH = resolve(homedir(), ".config/rexd/targets.json")
 const SESSION_STATE_ROOT = resolve(homedir(), ".config/opencode/rexd-target/sessions")
 const SESSION_STATE_TTL_MS = 1000 * 60 * 60 * 24 * 90
-const CLIENT_VERSION = "0.3.9"
+const CLIENT_VERSION = "0.3.10"
 const DEFAULT_READ_LIMIT = 2000
 const SAMPLE_BYTES = 4096
 const EXEC_OUTPUT_MAX_BYTES = 1024 * 1024
@@ -574,44 +574,36 @@ async function askRemoteSearchPermission(
   }
 }
 
-function unsupportedShellPathCandidates(command: string): ShellPathCandidate[] {
-  const candidates: ShellPathCandidate[] = []
-  const pattern = /(?:^|[\s"'=>|])((?:\/|\.\.?(?:\/|$)|~\/|\$HOME\/|\$\{HOME\}\/)[^\s"';&|<>`()]*?)(?=$|[\s"';&|<>`()])/g
-  for (const match of command.matchAll(pattern)) candidates.push({ raw: match[1], value: match[1] })
-  return candidates
-}
-
 function shellHomeSuffix(candidate: ShellPathCandidate): string | undefined {
   if (candidate.raw === "~" || candidate.raw.startsWith("~/")) return candidate.value === "~" ? "" : candidate.value.slice(2)
-  const expandsHome =
-    candidate.raw.startsWith("$HOME") ||
-    candidate.raw.startsWith("${HOME}") ||
-    candidate.raw.startsWith('"$HOME') ||
-    candidate.raw.startsWith('"${HOME}')
-  if (!expandsHome) return
-  if (candidate.value === "$HOME" || candidate.value === "${HOME}") return ""
-  if (candidate.value.startsWith("$HOME/")) return candidate.value.slice("$HOME/".length)
-  if (candidate.value.startsWith("${HOME}/")) return candidate.value.slice("${HOME}/".length)
 }
 
-function shellPaths(command: string, cwd: string, remote: boolean): { paths: string[]; remoteHome: boolean } {
-  const paths = new Set<string>()
+async function shellPaths(
+  command: string,
+  cwd: string,
+  remote: boolean,
+): Promise<{ paths: Array<{ path: string; kind: "file" | "directory" }>; remoteHome: boolean }> {
+  const paths = new Map<string, { path: string; kind: "file" | "directory" }>()
   let remoteHome = false
-  const scan = scanPosixShellPaths(command)
-  const candidates = scan.unsupported ? unsupportedShellPathCandidates(command) : scan.candidates
-  for (const candidate of candidates) {
+  const scan = await scanBashShellPaths(command)
+  for (const candidate of scan.candidates) {
+    const kind = candidate.directory ? "directory" : "file"
     const homeSuffix = shellHomeSuffix(candidate)
     if (homeSuffix !== undefined) {
       if (remote) {
         remoteHome = true
         continue
       }
-      paths.add(resolve(homedir(), homeSuffix))
+      const path = resolve(homedir(), homeSuffix)
+      paths.set(`${kind}\0${path}`, { path, kind })
       continue
     }
-    paths.add(remote ? normalizeRemotePath(candidate.value.startsWith("/") ? candidate.value : posix.join(cwd, candidate.value)) : resolve(cwd, candidate.value))
+    const path = remote
+      ? normalizeRemotePath(candidate.value.startsWith("/") ? candidate.value : posix.join(cwd, candidate.value))
+      : resolve(cwd, candidate.value)
+    paths.set(`${kind}\0${path}`, { path, kind })
   }
-  return { paths: [...paths], remoteHome }
+  return { paths: [...paths.values()], remoteHome }
 }
 
 export function remotePermissionScope(target: string): string {
@@ -668,7 +660,7 @@ export async function askBashPermission(
   cwd: string,
   remote?: { target: string; workspaceRoots: string[] },
 ): Promise<void> {
-  const scannedPaths = shellPaths(command, cwd, Boolean(remote))
+  const scannedPaths = await shellPaths(command, cwd, Boolean(remote))
   if (remote) {
     const roots = remote.workspaceRoots.map(normalizeRemotePath)
     if (roots.length > 0 && !roots.some((root) => inRoot(cwd, root))) {
@@ -690,10 +682,10 @@ export async function askBashPermission(
         remote: true,
       })
     }
-    for (const path of scannedPaths.paths) {
-      const normalized = normalizeRemotePath(path)
+    for (const scanned of scannedPaths.paths) {
+      const normalized = normalizeRemotePath(scanned.path)
       if (roots.some((root) => inRoot(normalized, root))) continue
-      const pattern = remoteExternalPattern(normalized, "file")
+      const pattern = remoteExternalPattern(normalized, scanned.kind)
       const scoped = remotePermissionPattern(remote.target, pattern)
       await askPermission(context, "external_directory", [scoped], [scoped], {
         command,
@@ -708,10 +700,10 @@ export async function askBashPermission(
   }
 
   if (!remote) {
-    for (const path of scannedPaths.paths) {
-      if (localPathInProject(context, path)) continue
-      const pattern = localExternalPattern(path, "file")
-      await askPermission(context, "external_directory", [pattern], [pattern], { command, filepath: path })
+    for (const scanned of scannedPaths.paths) {
+      if (localPathInProject(context, scanned.path)) continue
+      const pattern = localExternalPattern(scanned.path, scanned.kind)
+      await askPermission(context, "external_directory", [pattern], [pattern], { command, filepath: scanned.path })
     }
   }
 
