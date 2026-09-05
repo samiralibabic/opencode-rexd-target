@@ -3,15 +3,20 @@ import { existsSync, mkdtempSync, mkdirSync, readdirSync, rmSync, utimesSync, wr
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import {
+  assertTargetSnapshot,
+  buildTargetSystemContext,
   buildRemoteReadRpcParams,
   createExecBuffer,
   executeForSessionState,
+  formatTargetEndpoint,
   formatReadOutput,
   isBinaryReadFile,
+  loadTargetsFromPath,
   loadSessionStateFromPath,
   outputChunks,
   readLocalResolvedPath,
   remotePermissionScope,
+  renderTargetList,
   renderExecOutput,
   resolveEffectiveSessionState,
   resolveBashTimeout,
@@ -170,6 +175,195 @@ function mockPluginInput(directory: string, parents: Record<string, string | und
     },
   } as any
 }
+
+describe("target discovery and model context", () => {
+  const inactiveState = { activeTargetAlias: null, remoteCwdOverride: null, lastUsedAt: 1 }
+
+  test("lists endpoint, description, cwd, and active alias together", () => {
+    const targets = {
+      contabo: {
+        transport: "ssh" as const,
+        host: "161.97.89.121",
+        user: "root",
+        description: "Contabo\nCoolify control plane",
+        defaultCwd: "/root",
+      },
+      future: {
+        transport: "http" as const,
+        description: "Future transport",
+        defaultCwd: "/srv",
+      },
+      " prod ": {
+        transport: "ssh" as const,
+        host: "prod.example",
+        description: "Primary | blue\tlane",
+      },
+    }
+
+    expect(renderTargetList(targets, "contabo")).toBe(
+      [
+        "Available targets:",
+        '  * contabo | root@161.97.89.121:22 | "Contabo\\nCoolify control plane" | cwd /root',
+        "    future | http transport (unsupported) | Future transport | cwd /srv",
+        '    " prod " | prod.example:22 | "Primary | blue\\tlane" | cwd /',
+        "",
+        'Use /target use <alias> or target(action="use", alias="<alias>") to select a target for this chat.',
+      ].join("\n"),
+    )
+  })
+
+  test("formats IPv6 SSH endpoints without ambiguity", () => {
+    expect(formatTargetEndpoint({ transport: "ssh", host: "2001:db8::1", user: "root", port: 2222 })).toBe(
+      "root@[2001:db8::1]:2222",
+    )
+  })
+
+  test("reloads the target registry on every read", () => {
+    const path = join(tempDir(), "targets.json")
+    writeFileSync(path, JSON.stringify({ targets: { first: { transport: "ssh", host: "first.example" } } }))
+    expect(Object.keys(loadTargetsFromPath(path))).toEqual(["first"])
+
+    writeFileSync(path, JSON.stringify({ targets: { second: { transport: "ssh", host: "second.example" } } }))
+    expect(Object.keys(loadTargetsFromPath(path))).toEqual(["second"])
+  })
+
+  test("rejects a changed target snapshot before connection use", () => {
+    const expected = {
+      transport: "ssh" as const,
+      host: "first.example",
+      capabilities: { shell: true, fs: true },
+    }
+
+    expect(() =>
+      assertTargetSnapshot("prod", expected, {
+        capabilities: { fs: true, shell: true },
+        host: "first.example",
+        transport: "ssh",
+      }),
+    ).not.toThrow()
+    expect(() => assertTargetSnapshot("prod", expected, { ...expected, host: "second.example" })).toThrow(
+      "configuration changed during the operation",
+    )
+    expect(() => assertTargetSnapshot("prod", expected, null)).toThrow("is no longer configured")
+  })
+
+  test("gives conditional discovery guidance only when a usable target exists", () => {
+    expect(buildTargetSystemContext(inactiveState, {})).toBeNull()
+    expect(buildTargetSystemContext(inactiveState, { future: { transport: "ws" } })).toBeNull()
+
+    const context = buildTargetSystemContext(inactiveState, {
+      contabo: { transport: "ssh", host: "161.97.89.121" },
+    })
+    expect(context).toContain("Prefer a configured REXD target")
+    expect(context).toContain('target(action="list")')
+    expect(context).toContain("Direct SSH remains appropriate")
+  })
+
+  test("reports active routing without exposing sensitive SSH configuration", () => {
+    const context = buildTargetSystemContext(
+      { activeTargetAlias: "contabo", remoteCwdOverride: "/ignored", lastUsedAt: 1 },
+      {
+        contabo: {
+          transport: "ssh",
+          host: "161.97.89.121",
+          user: "root",
+          description: "Do not include this description",
+          defaultCwd: "/root",
+          identityFile: "/secret/id_ed25519",
+          sshOptions: ["ProxyCommand", "secret-proxy"],
+          command: "/secret/rexd --stdio",
+        },
+      },
+    )
+
+    expect(context).toContain('Active REXD target: "contabo" ("root@161.97.89.121:22")')
+    expect(context).toContain('configured remote cwd "/root"')
+    expect(context).toContain("already routed")
+    expect(context).not.toContain("Do not include this description")
+    expect(context).not.toContain("/secret")
+    expect(context).not.toContain("ProxyCommand")
+    expect(context).not.toContain("/ignored")
+  })
+
+  test("warns instead of claiming local fallback for unusable active state", () => {
+    const missing = buildTargetSystemContext(
+      { activeTargetAlias: "missing", remoteCwdOverride: null, lastUsedAt: 1 },
+      {},
+    )
+    const unsupported = buildTargetSystemContext(
+      { activeTargetAlias: "future", remoteCwdOverride: null, lastUsedAt: 1 },
+      { future: { transport: "http" } },
+    )
+
+    expect(missing).toContain("not configured")
+    expect(missing).toContain("fail closed")
+    expect(unsupported).toContain("transport is unsupported")
+    expect(unsupported).toContain("fail closed")
+  })
+
+  test("system hook ignores calls without a session ID", async () => {
+    const dir = tempDir()
+    const plugin = await RexdTargetPlugin(mockPluginInput(dir))
+    const output = { system: ["base"] }
+
+    await plugin["experimental.chat.system.transform"]!({ model: {} as any }, output)
+
+    expect(output.system).toEqual(["base"])
+  })
+
+  test("system hook follows inherited state changes", async () => {
+    const dir = tempDir()
+    const alias = `missing-${Math.random()}`
+    const parentID = `parent-${Math.random()}`
+    const childID = `child-${Math.random()}`
+    const parentPath = sessionStatePath(parentID)
+    stateFiles.push(parentPath)
+    saveSessionStateToPath(parentPath, {
+      activeTargetAlias: alias,
+      remoteCwdOverride: null,
+      lastUsedAt: Date.now(),
+    })
+    const plugin = await RexdTargetPlugin(mockPluginInput(dir, { [childID]: parentID }))
+    const hook = plugin["experimental.chat.system.transform"]!
+    const activeOutput = { system: ["base"] }
+
+    await hook({ sessionID: childID, model: {} as any }, activeOutput)
+    expect(activeOutput.system.join("\n")).toContain(alias)
+    expect(activeOutput.system.join("\n")).toContain("fail closed")
+
+    saveSessionStateToPath(parentPath, {
+      activeTargetAlias: null,
+      remoteCwdOverride: null,
+      lastUsedAt: Date.now(),
+    })
+    const inactiveOutput = { system: ["base"] }
+    await hook({ sessionID: childID, model: {} as any }, inactiveOutput)
+    expect(inactiveOutput.system.join("\n")).not.toContain(alias)
+  })
+
+  test("system hook preserves fail-closed context when state is corrupt", async () => {
+    const dir = tempDir()
+    const sessionID = `corrupt-${Math.random()}`
+    const path = sessionStatePath(sessionID)
+    stateFiles.push(path)
+    mkdirSync(dirname(path), { recursive: true })
+    writeFileSync(path, "{")
+    const plugin = await RexdTargetPlugin(mockPluginInput(dir))
+    const output = { system: ["base"] }
+
+    await expect(
+      plugin["experimental.chat.system.transform"]!({ sessionID, model: {} as any }, output),
+    ).resolves.toBeUndefined()
+    expect(output.system.join("\n")).toContain("routing state could not be resolved")
+    expect(output.system.join("\n")).toContain("fail closed")
+  })
+
+  test("tool descriptions steer remote administration through target selection", async () => {
+    const plugin = await RexdTargetPlugin(mockPluginInput(tempDir()))
+    expect((plugin.tool!.target as any).description).toContain("list targets when the host-to-alias mapping is uncertain")
+    expect((plugin.tool!.bash as any).description).toContain("matching configured REXD target before direct SSH")
+  })
+})
 
 describe("permissions and capabilities", () => {
   test("asks external_directory before a local path permission outside the worktree", async () => {

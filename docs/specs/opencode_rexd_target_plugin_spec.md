@@ -23,9 +23,9 @@ That means no “local vs remote tool” decision is pushed onto the model.
    - Instead, override OpenCode built-in tools by name (`bash`, `read`, `write`, etc.) and route based on active target.
    - When no target is active, wrappers can either pass through to local behavior (later) or behave as normal local built-ins by not being enabled.
 
-2. **SSH stdio is the primary transport**
-   - Primary transport is `ssh <host> /usr/local/bin/rexd --stdio`.
-   - HTTP/WS remain supported, but are not the first/default path for your workflow.
+2. **SSH stdio is the implemented transport**
+   - The plugin uses `ssh <host> /usr/local/bin/rexd --stdio`.
+   - HTTP/WS registry values are reserved for future transport implementations and are currently rejected.
 
 3. **PTY support is part of the core scope**
    - OpenCode’s built-in `bash` behavior is synchronous/non-interactive, so PTY must be exposed via dedicated tools (similar UX to existing PTY plugins).
@@ -96,7 +96,9 @@ Expose dedicated PTY tools backed by REXD PTY methods:
 (Exact naming can match OpenCode PTY ecosystem conventions for better agent familiarity.)
 
 ### F) Prompt/session awareness
-- Inject a short active-target line in prompt context (alias + remote cwd)
+- Inject short target-discovery guidance when configured targets are available but none is active
+- Inject a short active-target line in prompt context (alias + endpoint + configured remote cwd)
+- Warn without claiming local fallback when selected target state is unavailable
 - Keep it minimal and factual
 
 ---
@@ -208,7 +210,7 @@ Each target:
 - `command`: string (optional, default `/usr/local/bin/rexd --stdio`)
 - `sshOptions`: string[] (optional)
 
-### HTTP/WS target fields (supported, not primary)
+### HTTP/WS target fields (reserved; not implemented by this plugin)
 - `url`: string
 - `token`: string (optional)
 - `headers`: object (optional)
@@ -230,7 +232,7 @@ State must live outside model context and be managed by plugin/tool code.
 
 Fields:
 - `activeTargetAlias`: string | null
-- `remoteCwdOverride`: string | null (optional)
+- `remoteCwdOverride`: string | null (reserved; not currently applied to path resolution)
 - `lastUsedAt`: timestamp, refreshed when the chat actively uses or checks its selected target
 
 ### Global state (optional)
@@ -272,7 +274,7 @@ Optional:
 
 Use the documented hooks and keep interception deterministic.
 
-## 1) `tui.command.execute` (primary `/target` interception)
+## 1) `command.execute.before` (primary `/target` interception)
 
 Purpose:
 - detect `/target` marker payload
@@ -291,22 +293,26 @@ If the current OpenCode version cannot fully suppress normal slash-command flow:
 
 ---
 
-## 2) `tui.prompt.append` (active target context injection)
+## 2) `experimental.chat.system.transform` (target context injection)
 
 Purpose:
 - append concise, non-LLM-dependent execution context
 
 Injected content when target is active:
 - active target alias
-- remote cwd (effective)
-- remote workspace roots (shortened)
+- safe SSH endpoint
+- configured remote cwd
 - note that shell/file tools are routed to target
+
+When no target is active but usable SSH targets are configured, inject conditional guidance to prefer a known matching alias and use `target list` when the mapping is uncertain. Preserve direct SSH for diagnostics, repair, unconfigured hosts, and intentional further hops.
+
+When selected target state is missing, unsupported, or cannot be resolved, state that routed tools fail closed. Never imply that execution silently falls back to the local machine.
 
 Keep it very short.
 
 ---
 
-## 3) `tool.execute.before` (guardrails + telemetry)
+## 3) Tool definitions and execution wrappers (routing + guardrails)
 
 Purpose:
 - guard accidental mismatches
@@ -714,20 +720,22 @@ This is the practical skeleton to implement next in OpenCode.
 
 ### Plugin skeleton
 
-`rexd-target.ts` should implement three hooks:
+`rexd-target.ts` should implement three integration pieces:
 
-1. `tui.command.execute`
+1. `command.execute.before`
    - detect the marker from `target.md`
    - parse subcommands `list`, `use`, `status`, `clear`
    - read and write session state in `~/.config/opencode/rexd-target/sessions/<sha256(sessionID)>.json`
    - return short messages without relying on the model
 
-2. `tui.prompt.append`
-   - append one short line like active target alias and remote cwd
+2. `experimental.chat.system.transform`
+   - append concise discovery guidance or active target alias, endpoint, and configured remote cwd
+   - preserve fail-closed semantics when target state cannot be resolved
    - keep it factual and short
 
-3. `tool.execute.before`
-   - block PTY calls if target says PTY is unsupported
+3. Tool definitions and execution wrappers
+   - route built-in-compatible tool names according to session target state
+   - block operations when target capabilities are unsupported
    - add remote path guard checks for file tools
 
 ### Shared modules skeleton

@@ -4,6 +4,8 @@
 
 It routes tool calls to [REXD](https://github.com/samiralibabic/rexd), the Remote Execution Daemon, over SSH stdio (`ssh ... rexd --stdio`).
 
+SSH stdio is currently the only supported target transport.
+
 ![OpenCode with active REXD target routing tools to a remote machine](docs/images/opencode-rexd-target.png)
 
 ## What is REXD?
@@ -19,6 +21,7 @@ This plugin acts as the OpenCode client layer for REXD targets:
 ## Features
 
 - `/target` command handling: `list`, `use`, `status`, `clear`
+- Model-facing target discovery and active-routing context
 - Transparent tool routing to remote REXD when a target is active
 - Local fallback when no target is active
 - Core remote filesystem and shell support: `bash`, `read`, `write`, `list`, `glob`, `grep`
@@ -43,7 +46,7 @@ curl -fsSL https://raw.githubusercontent.com/samiralibabic/opencode-rexd-target/
 Pinned version:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/samiralibabic/opencode-rexd-target/main/scripts/install.sh | OPENCODE_REXD_TARGET_VERSION=v0.3.10 bash
+curl -fsSL https://raw.githubusercontent.com/samiralibabic/opencode-rexd-target/main/scripts/install.sh | OPENCODE_REXD_TARGET_VERSION=v0.3.11 bash
 ```
 
 The installer places files in your OpenCode config directory:
@@ -102,6 +105,10 @@ In OpenCode:
 
 Active target state is persisted per chat session under `~/.config/opencode/rexd-target/sessions/` and refreshed during normal remote use, so active chats are not pruned as stale.
 
+`/target list` shows each alias together with its SSH endpoint, description, and configured remote working directory. The registry is reloaded when it is used, so edits to `~/.config/rexd/targets.json` do not require an OpenCode restart.
+
+When no target is active, the plugin tells the model to prefer a confidently matched configured target for normal remote administration. Direct SSH remains available for REXD or SSH diagnostics, unconfigured hosts, and intentional further hops. When a target is active, the model receives its alias, endpoint, and configured remote working directory and is reminded that normal shell and file tools are already routed there.
+
 ## Updating (existing users)
 
 Update in this order:
@@ -118,7 +125,7 @@ Update commands:
 curl -fsSL https://raw.githubusercontent.com/samiralibabic/rexd/main/scripts/install.sh | REXD_VERSION=v0.1.5 bash
 
 # 2) local plugin
-curl -fsSL https://raw.githubusercontent.com/samiralibabic/opencode-rexd-target/main/scripts/install.sh | OPENCODE_REXD_TARGET_VERSION=v0.3.10 bash
+curl -fsSL https://raw.githubusercontent.com/samiralibabic/opencode-rexd-target/main/scripts/install.sh | OPENCODE_REXD_TARGET_VERSION=v0.3.11 bash
 ```
 
 If you update the plugin before `rexd`, remote `edit`/`apply_patch` calls can fail with method-not-found errors on older servers.

@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.3.11 - 2026-09-05
+
+- Add session-aware model context for target discovery, active routing, and fail-closed target-state errors.
+- Show target aliases together with their endpoints, descriptions, and configured remote working directories.
+- Reload the target registry on use and discard connections whose target configuration changed.
+- Clarify model-facing `target` and `bash` guidance around configured targets and intentional direct SSH use.
+
 ## v0.3.10 - 2026-08-07
 
 - Parse Bash path operands with `tree-sitter-bash` and OpenCode's command-based filesystem classification instead of scanning unsupported command text with a broad path regex.

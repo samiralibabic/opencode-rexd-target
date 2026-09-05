@@ -13,13 +13,14 @@ import { spawn } from "node:child_process"
 import { createHash, randomUUID } from "node:crypto"
 import { homedir } from "node:os"
 import { dirname, isAbsolute, posix, relative, resolve } from "node:path"
+import { isDeepStrictEqual } from "node:util"
 import { createTwoFilesPatch } from "diff"
 import { buildBashPermissionRequest, scanBashShellPaths, type ShellPathCandidate } from "./bash-permission"
 
 const TARGETS_PATH = resolve(homedir(), ".config/rexd/targets.json")
 const SESSION_STATE_ROOT = resolve(homedir(), ".config/opencode/rexd-target/sessions")
 const SESSION_STATE_TTL_MS = 1000 * 60 * 60 * 24 * 90
-const CLIENT_VERSION = "0.3.10"
+const CLIENT_VERSION = "0.3.11"
 const DEFAULT_READ_LIMIT = 2000
 const SAMPLE_BYTES = 4096
 const EXEC_OUTPUT_MAX_BYTES = 1024 * 1024
@@ -200,21 +201,14 @@ type ReadToolResult =
       attachments?: ReadAttachment[]
     }
 
-const targetsCache = new Map<string, TargetConfig>()
 const connections = new Map<string, Connection>()
 
-function loadTargets(): Record<string, TargetConfig> {
-  if (targetsCache.size > 0) return Object.fromEntries(targetsCache)
-  if (!existsSync(TARGETS_PATH)) return {}
+export function loadTargetsFromPath(path: string): Record<string, TargetConfig> {
+  if (!existsSync(path)) return {}
 
   try {
-    const parsed = JSON.parse(readFileSync(TARGETS_PATH, "utf-8")) as {
+    const parsed = JSON.parse(readFileSync(path, "utf-8")) as {
       targets?: Record<string, TargetConfig>
-    }
-    if (parsed.targets) {
-      for (const [alias, config] of Object.entries(parsed.targets)) {
-        targetsCache.set(alias, config)
-      }
     }
     return parsed.targets ?? {}
   } catch {
@@ -222,9 +216,12 @@ function loadTargets(): Record<string, TargetConfig> {
   }
 }
 
+function loadTargets(): Record<string, TargetConfig> {
+  return loadTargetsFromPath(TARGETS_PATH)
+}
+
 function getTarget(alias: string): TargetConfig | null {
-  loadTargets()
-  return targetsCache.get(alias) ?? null
+  return loadTargets()[alias] ?? null
 }
 
 function sessionFileName(opencodeSessionID: string): string {
@@ -1644,6 +1641,19 @@ function connectionKey(opencodeSessionID: string, alias: string): string {
   return `${opencodeSessionID}::${alias}`
 }
 
+function targetConfigMatches(left: TargetConfig, right: TargetConfig): boolean {
+  return isDeepStrictEqual(left, right)
+}
+
+export function assertTargetSnapshot(alias: string, expected: TargetConfig, current: TargetConfig | null): void {
+  if (!current) {
+    throw new Error(`Target ${JSON.stringify(alias)} is no longer configured. No operation was started; check target state and retry.`)
+  }
+  if (!targetConfigMatches(expected, current)) {
+    throw new Error(`Target ${JSON.stringify(alias)} configuration changed during the operation. No operation was started; retry to use the updated target.`)
+  }
+}
+
 function isAlive(connection: Connection): boolean {
   return !connection.closed && connection.proc.exitCode === null && !connection.proc.killed
 }
@@ -1978,13 +1988,18 @@ async function createConnection(
   }
 }
 
-async function ensureConnection(opencodeSessionID: string, state = loadSessionState(opencodeSessionID), signal?: AbortSignal): Promise<Connection> {
-  const { alias, target } = configuredActiveTarget(state)
+async function ensureConnection(
+  opencodeSessionID: string,
+  alias: string,
+  target: TargetConfig,
+  signal?: AbortSignal,
+): Promise<Connection> {
   if (signal) throwIfAborted(signal)
+  assertTargetSnapshot(alias, target, getTarget(alias))
 
   const key = connectionKey(opencodeSessionID, alias)
   const existing = connections.get(key)
-  if (existing && isAlive(existing)) {
+  if (existing && isAlive(existing) && targetConfigMatches(existing.target, target)) {
     return existing
   }
 
@@ -2003,9 +2018,14 @@ function disconnectAlias(opencodeSessionID: string, alias: string): void {
 }
 
 function reconcileSessionConnections(opencodeSessionID: string, state: SessionState): void {
+  const selectedTarget = state.activeTargetAlias ? getTarget(state.activeTargetAlias) : null
   for (const connection of connections.values()) {
     if (connection.opencodeSessionID !== opencodeSessionID) continue
-    if (state.activeTargetAlias === connection.alias) continue
+    if (
+      state.activeTargetAlias === connection.alias &&
+      selectedTarget &&
+      targetConfigMatches(connection.target, selectedTarget)
+    ) continue
     closeConnection(connection, "Target selection changed")
   }
 }
@@ -2286,6 +2306,72 @@ export function resolveBashTimeout(input: { timeout?: number; timeout_ms?: numbe
   return timeout
 }
 
+const TARGET_TOOL_DESCRIPTION =
+  "Select configured remote machines for transparent REXD execution in the current chat. Prefer a matching REXD target for remote administration; list targets when the host-to-alias mapping is uncertain before using direct SSH. After selection, use normal bash and file tools without SSH. Actions: list, use, status, clear."
+
+const BASH_TOOL_DESCRIPTION =
+  "Execute shell commands locally or on the active REXD target. Prefer selecting a matching configured REXD target before direct SSH for remote administration. Use direct SSH for REXD or SSH diagnostics, unconfigured hosts, or intentional further hops."
+
+const ROUTING_STATE_UNAVAILABLE_CONTEXT =
+  "REXD routing state could not be resolved. Routed tools fail closed; do not assume local execution until the target state is repaired."
+
+function displayTargetField(value: string): string {
+  if (value === value.trim() && !/[\u0000-\u001f|"\\]/.test(value)) return value
+  return JSON.stringify(value)
+}
+
+export function formatTargetEndpoint(target: TargetConfig): string {
+  if (target.transport !== "ssh") return `${target.transport} transport (unsupported)`
+
+  const host = target.host
+  if (!host) return "SSH host missing"
+
+  const displayHost = host.includes(":") && !(host.startsWith("[") && host.endsWith("]")) ? `[${host}]` : host
+  const user = target.user
+  return `${user ? `${user}@` : ""}${displayHost}:${target.port ?? 22}`
+}
+
+export function renderTargetList(targets: Record<string, TargetConfig>, activeAlias: string | null): string {
+  const entries = Object.entries(targets)
+  if (entries.length === 0) return "No targets configured. Create ~/.config/rexd/targets.json"
+
+  const list = entries
+    .map(([name, config]) => {
+      const active = activeAlias === name ? "*" : " "
+      const description = config.description || "No description"
+      return `  ${active} ${displayTargetField(name)} | ${displayTargetField(formatTargetEndpoint(config))} | ${displayTargetField(description)} | cwd ${displayTargetField(configuredRemoteCwd(config))}`
+    })
+    .join("\n")
+
+  return `Available targets:\n${list}\n\nUse /target use <alias> or target(action=\"use\", alias=\"<alias>\") to select a target for this chat.`
+}
+
+export function buildTargetSystemContext(
+  state: SessionState,
+  targets: Record<string, TargetConfig>,
+): string | null {
+  if (!state.activeTargetAlias) {
+    const hasUsableTarget = Object.values(targets).some((target) => target.transport === "ssh" && target.host)
+    if (!hasUsableTarget) return null
+
+    return "REXD remote targets are configured. Prefer a configured REXD target for remote administration: select a known matching alias with target(action=\"use\", alias=\"...\"), or call target(action=\"list\") first when the host-to-alias mapping is uncertain. Direct SSH remains appropriate for REXD or SSH diagnostics, unconfigured hosts, and intentional further hops."
+  }
+
+  const alias = state.activeTargetAlias
+  const target = targets[alias]
+  if (!target) {
+    return `REXD routing state selects target ${JSON.stringify(alias)}, but that target is not configured. Routed tools fail closed; do not assume local execution. Repair or clear the target selection before continuing.`
+  }
+  if (target.transport !== "ssh") {
+    return `REXD routing state selects target ${JSON.stringify(alias)}, but its ${JSON.stringify(target.transport)} transport is unsupported. Routed tools fail closed; do not assume local execution. Repair or clear the target selection before continuing.`
+  }
+  if (!target.host) {
+    return `REXD routing state selects target ${JSON.stringify(alias)}, but it has no SSH host. Routed tools fail closed; do not assume local execution. Repair or clear the target selection before continuing.`
+  }
+
+  return `Active REXD target: ${JSON.stringify(alias)} (${JSON.stringify(formatTargetEndpoint(target))}), configured remote cwd ${JSON.stringify(configuredRemoteCwd(target))}. Bash, file, search, patch, and PTY tools are already routed to this target and fail closed if routing is unavailable. Do not SSH to this same host unless intentionally diagnosing or repairing SSH/REXD, or making a further hop.`
+}
+
 type EffectiveStateResolver = (sessionID: string) => Promise<EffectiveSessionState>
 
 async function handleTargetSubcommand(
@@ -2298,19 +2384,7 @@ async function handleTargetSubcommand(
     case "list": {
       const targets = loadTargets()
       const { state } = await resolveState(opencodeSessionID)
-      const list = Object.entries(targets)
-        .map(([name, config]) => {
-          const active = state.activeTargetAlias === name ? "*" : " "
-          const description = config.description || config.host || "No description"
-          return `  ${active} ${name}: ${description}`
-        })
-        .join("\n")
-
-      if (!list) {
-        return "No targets configured. Create ~/.config/rexd/targets.json"
-      }
-
-      return `Available targets:\n${list}\n\nUse /target use <alias> to select a target for this chat.`
+      return renderTargetList(targets, state.activeTargetAlias)
     }
 
     case "use": {
@@ -2402,6 +2476,20 @@ export const RexdTargetPlugin: Plugin = async (input) => {
   }
 
   return {
+    "experimental.chat.system.transform": async ({ sessionID }, output) => {
+      if (!sessionID) return
+
+      let context: string | null
+      try {
+        const { state } = await resolveState(sessionID)
+        context = buildTargetSystemContext(state, loadTargets())
+      } catch {
+        context = ROUTING_STATE_UNAVAILABLE_CONTEXT
+      }
+
+      if (context) output.system.push(`REXD target context:\n${context}`)
+    },
+
     "command.execute.before": async (input, output) => {
       const parsed = parseTargetCommand(input)
       if (!parsed) return
@@ -2412,7 +2500,7 @@ export const RexdTargetPlugin: Plugin = async (input) => {
 
     tool: {
       target: tool({
-        description: "Manage REXD targets: list/use/status/clear",
+        description: TARGET_TOOL_DESCRIPTION,
         args: {
           action: tool.schema.string().describe("Action: list, use, status, clear"),
           alias: tool.schema.string().optional().describe("Target alias for use"),
@@ -2423,7 +2511,7 @@ export const RexdTargetPlugin: Plugin = async (input) => {
       }),
 
       bash: tool({
-        description: "Execute shell commands locally or on active REXD target",
+        description: BASH_TOOL_DESCRIPTION,
         args: {
           command: tool.schema.string().describe("Shell command"),
           description: tool.schema.string().optional().describe("Command description"),
@@ -2454,7 +2542,7 @@ export const RexdTargetPlugin: Plugin = async (input) => {
                 target: alias,
                 workspaceRoots: configuredWorkspaceRoots(target),
               })
-              const connection = await ensureConnection(context.sessionID, state, context.abort)
+              const connection = await ensureConnection(context.sessionID, alias, target, context.abort)
               const result = await runRemoteExec(connection, args.command, {
                 cwd: remoteCwd,
                 timeoutMs,
@@ -2494,7 +2582,7 @@ export const RexdTargetPlugin: Plugin = async (input) => {
                 workspaceRoots: configuredWorkspaceRoots(target),
                 target: alias,
               })
-              const connection = await ensureConnection(context.sessionID, state, context.abort)
+              const connection = await ensureConnection(context.sessionID, alias, target, context.abort)
               return (await readRemoteResolvedPath(connection, path, args, context.abort)) as ToolResult
             },
           })
@@ -2530,7 +2618,7 @@ export const RexdTargetPlugin: Plugin = async (input) => {
                 workspaceRoots: configuredWorkspaceRoots(target),
                 target: alias,
               })
-              const connection = await ensureConnection(context.sessionID, state, context.abort)
+              const connection = await ensureConnection(context.sessionID, alias, target, context.abort)
               await rpcRequest(
                 connection,
                 "fs.write",
@@ -2590,7 +2678,7 @@ export const RexdTargetPlugin: Plugin = async (input) => {
                 workspaceRoots: configuredWorkspaceRoots(target),
                 target: alias,
               })
-              const connection = await ensureConnection(context.sessionID, state, context.abort)
+              const connection = await ensureConnection(context.sessionID, alias, target, context.abort)
               let editMetadata: ReturnType<typeof buildEditUiMetadata> | undefined
               try {
                 let current = ""
@@ -2676,7 +2764,7 @@ export const RexdTargetPlugin: Plugin = async (input) => {
                   })
                 }
               }
-              const connection = await ensureConnection(context.sessionID, state, context.abort)
+              const connection = await ensureConnection(context.sessionID, alias, target, context.abort)
               let files: PatchUiFile[] | undefined
               try {
                 files = await buildRemotePatchUiFiles(connection, args.patchText, context.abort)
@@ -2726,7 +2814,7 @@ export const RexdTargetPlugin: Plugin = async (input) => {
                 target: alias,
                 kind: "directory",
               })
-              const connection = await ensureConnection(context.sessionID, state, context.abort)
+              const connection = await ensureConnection(context.sessionID, alias, target, context.abort)
               const response = await rpcRequest(
                 connection,
                 "fs.list",
@@ -2784,7 +2872,7 @@ export const RexdTargetPlugin: Plugin = async (input) => {
                 target: alias,
                 metadata: { pattern: args.pattern },
               })
-              const connection = await ensureConnection(context.sessionID, state, context.abort)
+              const connection = await ensureConnection(context.sessionID, alias, target, context.abort)
               const response = await rpcRequest(
                 connection,
                 "fs.glob",
@@ -2837,7 +2925,7 @@ export const RexdTargetPlugin: Plugin = async (input) => {
                 target: alias,
                 metadata: { pattern: args.pattern, include: args.include },
               })
-              const connection = await ensureConnection(context.sessionID, state, context.abort)
+              const connection = await ensureConnection(context.sessionID, alias, target, context.abort)
               let command = `rg -n --color=never ${shellQuote(args.pattern)}`
               if (args.include) command += ` --glob ${shellQuote(args.include)}`
               command += ` ${shellQuote(searchPath)}`
@@ -2866,7 +2954,7 @@ export const RexdTargetPlugin: Plugin = async (input) => {
             target: alias,
             workspaceRoots: configuredWorkspaceRoots(target),
           })
-          const connection = await ensureConnection(context.sessionID, state, context.abort)
+          const connection = await ensureConnection(context.sessionID, alias, target, context.abort)
           const open = rpcRequest(
             connection,
             "pty.open",
@@ -2918,7 +3006,7 @@ export const RexdTargetPlugin: Plugin = async (input) => {
             target: alias,
             workspaceRoots: configuredWorkspaceRoots(target),
           })
-          const connection = await ensureConnection(context.sessionID, state, context.abort)
+          const connection = await ensureConnection(context.sessionID, alias, target, context.abort)
           await rpcRequest(
             connection,
             "pty.input",
@@ -2941,7 +3029,7 @@ export const RexdTargetPlugin: Plugin = async (input) => {
           if (!state.activeTargetAlias) return getPtyNoRemoteTargetMessage(state)!
           const { alias, target } = configuredActiveTarget(state)
           assertTargetCapabilities(alias, target, ["pty"])
-          const connection = await ensureConnection(context.sessionID, state, context.abort)
+          const connection = await ensureConnection(context.sessionID, alias, target, context.abort)
           const buffer = connection.ptyBuffers.get(args.id) ?? createExecBuffer()
           if (!args.limit || args.limit <= 0) return renderExecOutput(buffer)
           return buffer.chunks.slice(-args.limit).map((chunk) => chunk.data).join("")
@@ -2956,7 +3044,7 @@ export const RexdTargetPlugin: Plugin = async (input) => {
           if (!state.activeTargetAlias) return getPtyNoRemoteTargetMessage(state)!
           const { alias, target } = configuredActiveTarget(state)
           assertTargetCapabilities(alias, target, ["pty"])
-          const connection = await ensureConnection(context.sessionID, state, context.abort)
+          const connection = await ensureConnection(context.sessionID, alias, target, context.abort)
           const ids = [...connection.ptyBuffers.keys()]
           return ids.length > 0 ? ids.join("\n") : "No active PTY sessions"
         },
@@ -2972,7 +3060,7 @@ export const RexdTargetPlugin: Plugin = async (input) => {
           if (!state.activeTargetAlias) return getPtyNoRemoteTargetMessage(state)!
           const { alias, target } = configuredActiveTarget(state)
           assertTargetCapabilities(alias, target, ["pty"])
-          const connection = await ensureConnection(context.sessionID, state, context.abort)
+          const connection = await ensureConnection(context.sessionID, alias, target, context.abort)
           await rpcRequest(
             connection,
             "pty.close",
