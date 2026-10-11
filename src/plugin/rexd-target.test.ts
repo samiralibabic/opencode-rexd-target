@@ -183,7 +183,7 @@ describe("target discovery and model context", () => {
     const targets = {
       contabo: {
         transport: "ssh" as const,
-        host: "161.97.89.121",
+        host: "203.0.113.10",
         user: "root",
         description: "Contabo\nCoolify control plane",
         defaultCwd: "/root",
@@ -203,7 +203,7 @@ describe("target discovery and model context", () => {
     expect(renderTargetList(targets, "contabo")).toBe(
       [
         "Available targets:",
-        '  * contabo | root@161.97.89.121:22 | "Contabo\\nCoolify control plane" | cwd /root',
+        '  * contabo | root@203.0.113.10:22 | "Contabo\\nCoolify control plane" | cwd /root',
         "    future | http transport (unsupported) | Future transport | cwd /srv",
         '    " prod " | prod.example:22 | "Primary | blue\\tlane" | cwd /',
         "",
@@ -252,7 +252,7 @@ describe("target discovery and model context", () => {
     expect(buildTargetSystemContext(inactiveState, { future: { transport: "ws" } })).toBeNull()
 
     const context = buildTargetSystemContext(inactiveState, {
-      contabo: { transport: "ssh", host: "161.97.89.121" },
+      contabo: { transport: "ssh", host: "203.0.113.10" },
     })
     expect(context).toContain("Prefer a configured REXD target")
     expect(context).toContain('target(action="list")')
@@ -265,7 +265,7 @@ describe("target discovery and model context", () => {
       {
         contabo: {
           transport: "ssh",
-          host: "161.97.89.121",
+          host: "203.0.113.10",
           user: "root",
           description: "Do not include this description",
           defaultCwd: "/root",
@@ -276,7 +276,7 @@ describe("target discovery and model context", () => {
       },
     )
 
-    expect(context).toContain('Active REXD target: "contabo" ("root@161.97.89.121:22")')
+    expect(context).toContain('Active REXD target: "contabo" ("root@203.0.113.10:22")')
     expect(context).toContain('configured remote cwd "/root"')
     expect(context).toContain("already routed")
     expect(context).not.toContain("Do not include this description")
