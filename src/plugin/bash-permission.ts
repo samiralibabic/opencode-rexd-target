@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto"
+import { homedir } from "node:os"
 import { isAbsolute, posix } from "node:path"
 import { fileURLToPath } from "node:url"
 import { Language, Parser, type Node } from "web-tree-sitter"
@@ -18,7 +18,7 @@ export type ParsedSimpleCommand = {
 
 export type PosixCommandParse = {
   commands: ParsedSimpleCommand[]
-  /** True when this deliberately small parser cannot safely model the input. */
+  /** True when the Bash tree contains parse errors. */
   unsupported: boolean
 }
 
@@ -44,6 +44,8 @@ export type BashPermissionOptions = {
    * `remote:production:`. Include any separator wanted in the prefix.
    */
   remoteScope?: string
+  /** Effective local working directory supplied by the bash tool call. */
+  cwd?: string
   /** Alias for remoteScope for callers which use a generic scope name. */
   scope?: string
 }
@@ -53,42 +55,12 @@ export type BashPermissionRequest = {
   always: string[]
   commands: ParsedSimpleCommand[]
   unsupported: boolean
-  /** Present only for a fail-closed request. */
-  guard?: string
-}
-
-type LexItem =
-  | { kind: "word"; raw: string; value: string }
-  | { kind: "redirection"; raw: string }
-
-type TopLevelScan = {
-  sources: string[]
-  unsupported: boolean
 }
 
 type BashPart = {
   type: string
   text: string
 }
-
-const SHELL_KEYWORDS = new Set([
-  "!",
-  "case",
-  "do",
-  "done",
-  "elif",
-  "else",
-  "esac",
-  "fi",
-  "for",
-  "function",
-  "if",
-  "in",
-  "select",
-  "then",
-  "until",
-  "while",
-])
 
 // Keep this aligned with OpenCode's FILES set in packages/opencode/src/tool/shell.ts.
 // `find` remains a documented RexD extension limited to root operands below.
@@ -188,269 +160,6 @@ function staticPathCandidate(part: BashPart): ShellPathCandidate | undefined {
   return { raw: part.text, value: globDirectoryPrefix(prefix), directory: true }
 }
 
-function isCommentStart(input: string, index: number): boolean {
-  return index === 0 || /[\s;&|(){}]/.test(input[index - 1] ?? "")
-}
-
-/**
- * Split the POSIX list operators needed by permission scanning.  Shell
- * substitutions, groups, heredocs, comments, and other grammar we cannot
- * inspect recursively are rejected rather than guessed at.
- */
-function splitTopLevel(command: string): TopLevelScan {
-  const sources: string[] = []
-  let source = ""
-  let quote: "single" | "double" | undefined
-  let expectsCommand = false
-  let finalOperator: "&&" | "||" | ";" | "&" | "|" | "newline" | undefined
-
-  const push = (operator: NonNullable<typeof finalOperator>) => {
-    const text = source.trim()
-    source = ""
-    if (!text) {
-      // Blank lines are harmless. Other empty list elements are syntax we do
-      // not model (except a newline after an incomplete list, which may be a
-      // POSIX line continuation before the next command).
-      if (operator === "newline") return true
-      return false
-    }
-    sources.push(text)
-    expectsCommand = operator !== ";" && operator !== "newline"
-    finalOperator = operator
-    return true
-  }
-
-  for (let index = 0; index < command.length; index++) {
-    const char = command[index]
-
-    if (quote === "single") {
-      source += char
-      if (char === "'") quote = undefined
-      continue
-    }
-
-    if (quote === "double") {
-      if (char === "`" || (char === "$" && command[index + 1] === "(")) {
-        return { sources: [], unsupported: true }
-      }
-      if (char === "\\") {
-        const next = command[index + 1]
-        if (next === undefined || next === "\n") return { sources: [], unsupported: true }
-        source += char + next
-        index++
-        continue
-      }
-      source += char
-      if (char === '"') quote = undefined
-      continue
-    }
-
-    if (char === "\\") {
-      const next = command[index + 1]
-      if (next === undefined || next === "\n") return { sources: [], unsupported: true }
-      source += char + next
-      index++
-      continue
-    }
-    if (char === "'") {
-      quote = "single"
-      source += char
-      continue
-    }
-    if (char === '"') {
-      quote = "double"
-      source += char
-      continue
-    }
-
-    // Command substitutions and compound shell grammar need recursive
-    // parsing, so a top-level split would not be safe.
-    if (char === "`" || (char === "$" && command[index + 1] === "(") || "(){}".includes(char)) {
-      return { sources: [], unsupported: true }
-    }
-    if (char === "#" && isCommentStart(command, index)) {
-      const newline = command.indexOf("\n", index + 1)
-      if (newline === -1) break
-      index = newline - 1
-      continue
-    }
-
-    // Here-documents and Bash-only force-redirection cannot be represented by
-    // this simple scanner. Ordinary <, >, >>, <>, <&, and >& are retained in
-    // the simple-command source and handled by lexSimple below.
-    if (char === "<" && command[index + 1] === "<") return { sources: [], unsupported: true }
-    if (char === ">" && command[index + 1] === "|") return { sources: [], unsupported: true }
-    if (char === "&" && command[index + 1] === ">") return { sources: [], unsupported: true }
-
-    if (char === "&" && (command[index - 1] === ">" || command[index - 1] === "<")) {
-      source += char
-      continue
-    }
-
-    if (char === "&" || char === "|" || char === ";" || char === "\n") {
-      let operator: NonNullable<typeof finalOperator>
-      if (char === "&" && command[index + 1] === "&") {
-        operator = "&&"
-        index++
-      } else if (char === "|" && command[index + 1] === "|") {
-        operator = "||"
-        index++
-      } else if (char === "&") {
-        operator = "&"
-      } else if (char === "|") {
-        operator = "|"
-      } else if (char === ";") {
-        operator = ";"
-      } else {
-        operator = "newline"
-      }
-      if (!push(operator)) return { sources: [], unsupported: true }
-      continue
-    }
-
-    source += char
-  }
-
-  if (quote) return { sources: [], unsupported: true }
-  const final = source.trim()
-  if (final) {
-    sources.push(final)
-    expectsCommand = false
-  }
-  if (expectsCommand && finalOperator !== ";" && finalOperator !== "newline") {
-    return { sources: [], unsupported: true }
-  }
-  return { sources, unsupported: false }
-}
-
-/** Lex one simple command enough to remove assignments and redirections. */
-function lexSimple(source: string): { items: LexItem[]; unsupported: boolean } {
-  const items: LexItem[] = []
-  let raw = ""
-  let value = ""
-  let started = false
-  let quote: "single" | "double" | undefined
-
-  const pushWord = () => {
-    if (!started) return
-    items.push({ kind: "word", raw, value })
-    raw = ""
-    value = ""
-    started = false
-  }
-
-  for (let index = 0; index < source.length; index++) {
-    const char = source[index]
-
-    if (quote === "single") {
-      raw += char
-      if (char === "'") quote = undefined
-      else value += char
-      continue
-    }
-
-    if (quote === "double") {
-      if (char === "`" || (char === "$" && source[index + 1] === "(")) {
-        return { items: [], unsupported: true }
-      }
-      raw += char
-      if (char === "\\") {
-        const next = source[index + 1]
-        if (next === undefined || next === "\n") return { items: [], unsupported: true }
-        raw += next
-        value += next
-        index++
-      } else if (char === '"') {
-        quote = undefined
-      } else {
-        value += char
-      }
-      continue
-    }
-
-    if (/\s/.test(char)) {
-      pushWord()
-      continue
-    }
-    if (char === "'") {
-      started = true
-      raw += char
-      quote = "single"
-      continue
-    }
-    if (char === '"') {
-      started = true
-      raw += char
-      quote = "double"
-      continue
-    }
-    if (char === "\\") {
-      const next = source[index + 1]
-      if (next === undefined || next === "\n") return { items: [], unsupported: true }
-      started = true
-      raw += char + next
-      value += next
-      index++
-      continue
-    }
-    if (char === "<" || char === ">") {
-      let io = ""
-      if (started && /^\d+$/.test(raw)) {
-        io = raw
-        raw = ""
-        value = ""
-        started = false
-      } else {
-        pushWord()
-      }
-
-      const next = source[index + 1]
-      if (char === "<" && next === "<") return { items: [], unsupported: true }
-      if (char === ">" && next === "|") return { items: [], unsupported: true }
-      let operator = char
-      if ((char === ">" && next === ">") || (char === "<" && (next === ">" || next === "&")) || (char === ">" && next === "&")) {
-        operator += next
-        index++
-      }
-      items.push({ kind: "redirection", raw: io + operator })
-      continue
-    }
-
-    started = true
-    raw += char
-    value += char
-  }
-
-  if (quote) return { items: [], unsupported: true }
-  pushWord()
-  return { items, unsupported: false }
-}
-
-function commandTokens(source: string): { tokens: string[]; unsupported: boolean } {
-  const lexed = lexSimple(source)
-  if (lexed.unsupported) return { tokens: [], unsupported: true }
-
-  const tokens: string[] = []
-  let redirectionOperand = false
-  for (const item of lexed.items) {
-    if (item.kind === "redirection") {
-      if (redirectionOperand) return { tokens: [], unsupported: true }
-      redirectionOperand = true
-      continue
-    }
-    if (redirectionOperand) {
-      redirectionOperand = false
-      continue
-    }
-    // POSIX assignment words appear before the command name. Removing every
-    // assignment-looking word is also harmless for BashArity's command prefix.
-    if (/^[A-Za-z_][A-Za-z0-9_]*=.*/.test(item.raw)) continue
-    // OpenCode's tree-sitter nodes retain quoting and escaping in token text.
-    tokens.push(item.raw)
-  }
-  return redirectionOperand ? { tokens: [], unsupported: true } : { tokens, unsupported: false }
-}
-
 function pathArguments(command: string, parts: BashPart[]): ShellPathCandidate[] {
   return parts
     .filter((part) => !part.text.startsWith("-") && !(command === "chmod" && part.text.startsWith("+")))
@@ -530,23 +239,25 @@ export async function scanBashShellPaths(command: string): Promise<BashShellPath
   }
 }
 
-/**
- * Parses ordinary POSIX simple-command lists without executing or expanding
- * anything. Unsupported shell grammar is reported instead of approximated.
- */
-export function parsePosixShellCommands(command: string): PosixCommandParse {
-  const split = splitTopLevel(command)
-  if (split.unsupported) return { commands: [], unsupported: true }
-
-  const commands: ParsedSimpleCommand[] = []
-  for (const source of split.sources) {
-    const parsed = commandTokens(source)
-    if (parsed.unsupported || SHELL_KEYWORDS.has(parsed.tokens[0] ?? "")) {
-      return { commands: [], unsupported: true }
+/** Parse OpenCode's command nodes, including nested shell constructs. */
+export async function parsePosixShellCommands(command: string): Promise<PosixCommandParse> {
+  const tree = (await bashParser()).parse(command)
+  if (!tree) throw new Error("Failed to parse Bash command")
+  try {
+    return {
+      commands: tree.rootNode.descendantsOfType("command").map(parsedCommand),
+      unsupported: tree.rootNode.hasError,
     }
-    commands.push({ source, tokens: parsed.tokens })
+  } finally {
+    tree.delete()
   }
-  return { commands, unsupported: false }
+}
+
+function parsedCommand(node: Node): ParsedSimpleCommand {
+  return {
+    source: (node.parent?.type === "redirected_statement" ? node.parent.text : node.text).trim(),
+    tokens: bashCommandParts(node).map((part) => part.text),
+  }
 }
 
 /*
@@ -709,58 +420,176 @@ export const BashArity = {
   prefix: bashArityPrefix,
 } as const
 
-/** An opaque, stable rule used only when parsing must fail closed. */
-export function bashPermissionGuard(command: string): string {
-  return `sha256:${createHash("sha256").update(command, "utf8").digest("hex")}`
-}
-
 function prefixRule(scope: string | undefined, rule: string): string {
   return scope ? scope + rule : rule
 }
 
-/**
- * Build OpenCode-style bash permission patterns without shell parser/runtime
- * dependencies. A parse failure intentionally has no command-family rule:
- * both its exact command and an opaque SHA-256 guard must be approved.
- */
-export function buildBashPermissionRequest(command: string, options: BashPermissionOptions = {}): BashPermissionRequest {
+/** Decode literal words only; never expand variables or execute shell text. */
+function literalWord(raw: string): string | undefined {
+  if (/[$\n\r{}]/.test(raw) || raw.includes("`") || raw.includes("<(") || raw.includes(">(")) return
+  let value = ""
+  let quote: string | undefined
+  for (let i = 0; i < raw.length; i++) {
+    const char = raw[i]
+    if (char === "\\" && quote !== "'") {
+      const next = raw[++i]
+      if (next === undefined) return
+      if (quote === '"' && !['"', "\\"].includes(next)) value += "\\"
+      value += next
+    } else if (quote) {
+      if (char === quote) quote = undefined
+      else value += char
+    } else if (char === "'" || char === '"') quote = char
+    else value += char
+  }
+  return quote ? undefined : value
+}
+
+function absoluteOperand(raw: string, cwd: string | undefined): string | undefined {
+  let value = literalWord(raw)
+  if (!value) return
+  if (value.startsWith("~")) {
+    // Quoted/escaped tildes are literal; ~user requires runtime lookup.
+    if (raw !== value || !(value === "~" || value.startsWith("~/"))) return
+    value = homedir() + value.slice(1)
+  }
+  if (!posix.isAbsolute(value)) {
+    if (!cwd || !posix.isAbsolute(cwd)) return
+    // Do not normalize across glob components before considering expansion.
+    value = cwd.replace(/\/$/, "") + "/" + value
+  }
+  const glob = /[?*[]/.exec(value)
+  if (glob) {
+    const slash = value.lastIndexOf("/", glob.index)
+    const suffix = value.slice(slash + 1)
+    if (suffix.split("/").includes("..")) return
+    const prefix = posix.normalize(value.slice(0, slash + 1))
+    return prefix.replace(/\/$/, "") + "/" + suffix
+  }
+  const normalized = posix.normalize(value)
+  return value.endsWith("/") && !normalized.endsWith("/") ? normalized + "/" : normalized
+}
+
+function commandArguments(node: Node): Node[] {
+  return node.childrenForFieldName("argument")
+}
+
+function changedDirectory(node: Node, cwd: string | undefined): string | undefined {
+  const args = commandArguments(node).map((arg) => arg.text)
+  if (args[0] === "--") args.shift()
+  if (args.length !== 1 || args[0] === "-" || /[?*[]/.test(args[0])) return
+  return absoluteOperand(args[0], cwd)
+}
+
+/** Child shells never leak cwd; ambiguous control flow invalidates it. */
+function commandDirectories(root: Node, initial: string | undefined): Map<number, string | undefined> {
+  const directories = new Map<number, string | undefined>()
+  const functions = new Set(root.descendantsOfType("function_definition").map((node) => node.childForFieldName("name")?.text))
+  const changesCwd = (node: Node) => node.descendantsOfType("command").some((item) =>
+    CWD_ONLY_COMMANDS.has(bashCommandParts(item)[0]?.text ?? "") || functions.has(bashCommandParts(item)[0]?.text),
+  )
+  const visit = (node: Node, cwd: string | undefined): string | undefined => {
+    if (node.type === "command") {
+      directories.set(node.id, cwd)
+      for (const child of node.namedChildren) visit(child, cwd)
+      const name = bashCommandParts(node)[0]?.text
+      if (name === "cd" || name === "chdir") return changedDirectory(node, cwd)
+      return name && (CWD_ONLY_COMMANDS.has(name) || functions.has(name)) ? undefined : cwd
+    }
+    if (["subshell", "command_substitution", "process_substitution", "pipeline"].includes(node.type)) {
+      if (node.type === "pipeline") for (const child of node.namedChildren) visit(child, cwd)
+      else sequence(node, cwd)
+      return cwd
+    }
+    if (["function_definition", "for_statement", "c_style_for_statement", "while_statement", "if_statement", "case_statement"].includes(node.type)) {
+      const changes = changesCwd(node)
+      // Functions execute at their invocation cwd; loops may repeat relative
+      // cd; conditional branches require a runtime join. Do not guess these.
+      const start = node.type === "function_definition" || changes ? undefined : cwd
+      if (changes && ["if_statement", "case_statement"].includes(node.type)) {
+        for (const child of node.namedChildren) visit(child, undefined)
+      } else sequence(node, start)
+      return node.type === "function_definition" || !changes ? cwd : undefined
+    }
+    return sequence(node, cwd)
+  }
+  const sequence = (node: Node, cwd: string | undefined): string | undefined => {
+    for (let i = 0; i < node.childCount; i++) {
+      const child = node.child(i)
+      if (!child?.isNamed) continue
+      const next = node.child(i + 1)?.text
+      const previous = node.child(i - 1)?.text
+      const result = visit(child, previous === "||" ? undefined : cwd)
+      if (next !== "&") {
+        // Only && proves a preceding cd succeeded. With a following command
+        // after ; or newline, a failed cd leaves a different runtime cwd.
+        const hasFollowing = node.children.slice(i + 1).some((item) => item.isNamed)
+        cwd = hasFollowing && next !== "&&" && result !== cwd ? undefined : result
+      }
+      if (previous === "||") cwd = undefined
+    }
+    return cwd
+  }
+  visit(root, initial)
+  return directories
+}
+
+function rmPatterns(node: Node, cwd: string | undefined): string[] | undefined {
+  const options: string[] = []
+  const operands: string[] = []
+  let ended = false
+  for (const arg of commandArguments(node)) {
+    const raw = arg.text
+    const value = literalWord(raw)
+    if (!ended && value === "--") {
+      ended = true
+      options.push(raw)
+    } else if (!ended && value?.startsWith("-") && value !== "-") options.push(value)
+    else operands.push(absoluteOperand(raw, cwd) ?? raw)
+  }
+  if (!operands.length) return
+  return operands.map((operand) => ["rm", ...options, operand].join(" "))
+}
+
+function uncoveredError(root: Node, commands: Node[]): boolean {
+  const visit = (node: Node, error = false): boolean => {
+    if (commands.some((command) => command.startIndex <= node.startIndex && command.endIndex >= node.endIndex)) return false
+    error ||= node.isError || node.isMissing
+    if (!node.childCount) return error && (node.isMissing || Boolean(node.text.trim()))
+    return node.children.some((child) => visit(child, error))
+  }
+  return visit(root)
+}
+
+/** Native command-node checks, with local-only rm operand normalization. */
+export async function buildBashPermissionRequest(command: string, options: BashPermissionOptions = {}): Promise<BashPermissionRequest> {
   const scope = options.remoteScope ?? options.scope
-  const parsed = parsePosixShellCommands(command)
-  if (parsed.unsupported) {
-    const guard = bashPermissionGuard(command)
-    const exact = prefixRule(scope, command)
-    const scopedGuard = prefixRule(scope, guard)
-    return {
-      patterns: unique([exact, scopedGuard]),
-      always: unique([exact, scopedGuard]),
-      commands: [],
-      unsupported: true,
-      guard: scopedGuard,
-    }
-  }
-
-  const patterns: string[] = []
-  const always: string[] = []
-  for (const item of parsed.commands) {
-    const commandName = item.tokens[0]
-    if (commandName && CWD_ONLY_COMMANDS.has(commandName)) continue
-    // An assignments-only command has no executable command name. A
-    // redirection-only command still changes the filesystem, so retain its
-    // exact source but deliberately do not grant a command family.
-    if (item.tokens.length === 0 && !/[<>]/.test(item.source)) continue
-    patterns.push(prefixRule(scope, item.source))
-    if (item.tokens.length > 0) {
+  const tree = (await bashParser()).parse(command)
+  // Native OpenCode aborts when parsing returns no tree; do not downgrade a
+  // parser failure into a whole-line rule that a default-allow policy accepts.
+  if (!tree) throw new Error("Failed to parse Bash command")
+  try {
+    const root = tree.rootNode
+    const nodes = root.descendantsOfType("command")
+    const commands = nodes.map(parsedCommand)
+    const directories = scope ? new Map<number, string | undefined>() : commandDirectories(root, root.hasError ? undefined : options.cwd)
+    const patterns: string[] = []
+    const always: string[] = []
+    for (let i = 0; i < nodes.length; i++) {
+      const item = commands[i]
+      const name = item.tokens[0]
+      if (!item.tokens.length || (name && CWD_ONLY_COMMANDS.has(name))) continue
+      const resolved = !scope && name === "rm" ? rmPatterns(nodes[i], directories.get(nodes[i].id)) : undefined
+      patterns.push(...(resolved ?? [item.source]).map((rule) => prefixRule(scope, rule)))
       always.push(prefixRule(scope, bashArityPrefix(item.tokens).join(" ") + " *"))
-    } else {
-      always.push(prefixRule(scope, item.source))
     }
-  }
-
-  return {
-    patterns: unique(patterns),
-    always: unique(always),
-    commands: parsed.commands,
-    unsupported: false,
+    if (root.hasError && uncoveredError(root, nodes)) {
+      patterns.push(prefixRule(scope, command))
+      always.push(prefixRule(scope, command))
+    }
+    return { patterns: unique(patterns), always: unique(always), commands, unsupported: root.hasError }
+  } finally {
+    tree.delete()
   }
 }
 

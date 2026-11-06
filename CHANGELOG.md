@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.3.12 - 2026-11-06
+
+- Check every nested Bash command with the same Tree-sitter command-node traversal as OpenCode, closing compound-command permission bypasses without whole-line hash guards.
+- Check local rm operands individually, resolving literal paths against the tool working directory and statically successful cd chains while preserving dynamic operands and remote target scopes.
+- Retain recovered command checks and uncovered error text on malformed input; abort on parser failure instead of weakening permission checks.
+
 ## v0.3.11 - 2026-09-05
 
 - Add session-aware model context for target discovery, active routing, and fail-closed target-state errors.

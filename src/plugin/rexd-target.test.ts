@@ -450,7 +450,7 @@ describe("permissions and capabilities", () => {
       }
       await expect((plugin.tool!.bash as any).execute({ command }, context)).rejects.toThrow("stop before execution")
       expect(asks[0].permission).toBe("bash")
-      expect(asks[0].patterns).toEqual(["git status", "rm -rf build"])
+      expect(asks[0].patterns).toEqual(["git status", "rm -rf " + directory + "/build"])
       expect(asks[0].always).toEqual(["git status *", "rm *"])
     }
   })
@@ -609,6 +609,16 @@ done`
 
     expect(asks[0]).toMatchObject({ permission: "external_directory", patterns: ["/etc/hosts"] })
     expect(asks[1].permission).toBe("bash")
+  })
+
+  test("passes the tool working directory into local rm permission resolution", async () => {
+    const directory = tempDir()
+    const { context, asks } = mockContext(directory)
+    await askBashPermission(context as any, "rm -rf build output", directory)
+    expect(asks.find((ask) => ask.permission === "bash")).toMatchObject({
+      patterns: ["rm -rf " + directory + "/build", "rm -rf " + directory + "/output"],
+      always: ["rm *"],
+    })
   })
 
   test("isolates remote bash approvals from local execution and other targets", async () => {
