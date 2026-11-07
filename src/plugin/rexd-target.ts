@@ -20,7 +20,7 @@ import { buildBashPermissionRequest, scanBashShellPaths, type ShellPathCandidate
 const TARGETS_PATH = resolve(homedir(), ".config/rexd/targets.json")
 const SESSION_STATE_ROOT = resolve(homedir(), ".config/opencode/rexd-target/sessions")
 const SESSION_STATE_TTL_MS = 1000 * 60 * 60 * 24 * 90
-const CLIENT_VERSION = "0.3.13"
+const CLIENT_VERSION = "0.3.14"
 const DEFAULT_READ_LIMIT = 2000
 const SAMPLE_BYTES = 4096
 const EXEC_OUTPUT_MAX_BYTES = 1024 * 1024

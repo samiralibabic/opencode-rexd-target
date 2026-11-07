@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.3.14 - 2026-11-07
+
+- Same changes as v0.3.13, which was tagged but not released because a test used a machine-specific path; the test now uses the system temp directory.
+
 ## v0.3.13 - 2026-11-07
 
 - Resolve literal same-command-line variables in local rm and cd operands, including plain export assignments, without consulting the environment or executing shell text.

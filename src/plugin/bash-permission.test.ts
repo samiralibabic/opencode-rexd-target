@@ -1,6 +1,6 @@
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs"
-import { posix } from "node:path"
-import { homedir } from "node:os"
+import { join, posix } from "node:path"
+import { homedir, tmpdir } from "node:os"
 import { describe, expect, spyOn, test } from "bun:test"
 import { Parser } from "web-tree-sitter"
 import {
@@ -411,7 +411,7 @@ describe("literal variables and project-local rm permissions", () => {
   })
 
   test("emits project paths only strictly within a verified session git root", async () => {
-    const root = mkdtempSync('/tmp/agents/rexd-project-rm/test-project-')
+    const root = mkdtempSync(join(tmpdir(), 'rexd-project-'))
     try {
       mkdirSync(root + '/.git')
       mkdirSync(root + '/.worktrees/x/sub', { recursive: true })
