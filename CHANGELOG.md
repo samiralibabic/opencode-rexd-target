@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.3.13 - 2026-11-07
+
+- Resolve literal same-command-line variables in local rm and cd operands, including plain export assignments, without consulting the environment or executing shell text.
+- Expand literal for-in loop values into separate rm permission patterns; keep uncertain assignments, branches, and dynamic lists unresolved.
+- Add opt-in project-relative rm permission patterns for verified session Git roots, excluding repository roots, Git metadata, nested repository/worktree roots, and glob-bearing paths.
+- Document ordered project permission rules and preserve remote scopes and existing temporary-directory policies.
+
 ## v0.3.12 - 2026-11-06
 
 - Check every nested Bash command with the same Tree-sitter command-node traversal as OpenCode, closing compound-command permission bypasses without whole-line hash guards.

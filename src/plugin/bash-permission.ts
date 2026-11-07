@@ -1,3 +1,4 @@
+import { lstatSync } from "node:fs"
 import { homedir } from "node:os"
 import { isAbsolute, posix } from "node:path"
 import { fileURLToPath } from "node:url"
@@ -46,6 +47,8 @@ export type BashPermissionOptions = {
   remoteScope?: string
   /** Effective local working directory supplied by the bash tool call. */
   cwd?: string
+  /** Session git top level (ToolContext.worktree), never the tool cwd. */
+  projectRoot?: string
   /** Alias for remoteScope for callers which use a generic scope name. */
   scope?: string
 }
@@ -445,17 +448,175 @@ function literalWord(raw: string): string | undefined {
   return quote ? undefined : value
 }
 
-function absoluteOperand(raw: string, cwd: string | undefined): string | undefined {
-  let value = literalWord(raw)
+type Variables = Map<string, readonly string[]>
+
+// These builtins can mutate shell state through options, indirection, traps,
+// or dynamically named assignments. Never simulate their behavior.
+const UNKNOWN_VARIABLE_WRITERS = new Set(["read", "eval", "source", ".", "let", "printf", "getopts", "mapfile", "readarray", "trap", "builtin", "command", "set", "shift", "local", "declare", "typeset", "readonly"])
+
+/** Restricted shell-word decoder: no environment, evaluation, or rescan. */
+function expandedWords(raw: string, variables: Variables, assignment = false): string[] | undefined {
+  let values = [""]
+  let quote: string | undefined
+  const append = (parts: readonly string[]) => { values = values.flatMap((value) => parts.map((part) => value + part)) }
+  for (let i = 0; i < raw.length; i++) {
+    const char = raw[i]
+    if (char === "\\" && quote !== "'") {
+      const next = raw[++i]
+      if (next === undefined || next === "\n" || next === "\r") return
+      if (quote === '"' && !['"', "\\", "$", String.fromCharCode(96)].includes(next)) append(["\\"])
+      append([next])
+    } else if (quote === "'") {
+      if (char === quote) quote = undefined
+      else append([char])
+    } else if (char === quote) quote = undefined
+    else if (!quote && (char === "'" || char === '"')) quote = char
+    else if (char === "$" && !assignment) {
+      const match = /^(?:\$([a-zA-Z_][a-zA-Z_0-9]*)|\$\{([a-zA-Z_][a-zA-Z_0-9]*)\})/.exec(raw.slice(i))
+      const known = match && variables.get(match[1] ?? match[2])
+      if (!known) return
+      if (!quote && known.some((value) => !value || /[\s?*[]/.test(value))) return
+      append(known)
+      i += match![0].length - 1
+    } else {
+      if (char === "$" || char === String.fromCharCode(96) || /[\n\r{}]/.test(char) || (!quote && /[<>]/.test(char))) return
+      if (assignment && /[?*[]/.test(char)) return
+      append([char])
+    }
+    if (values.length > 128) return
+  }
+  return quote ? undefined : unique(values)
+}
+
+function assignmentName(node: Node): string | undefined {
+  const name = node.childForFieldName("name")?.text
+  return name && /^[a-zA-Z_][a-zA-Z_0-9]*$/.test(name) ? name : undefined
+}
+
+/** Values flow only through unconditional same-line sequences, never env. */
+function commandVariables(root: Node): Map<number, Variables> {
+  const result = new Map<number, Variables>()
+  const functions = new Set(root.descendantsOfType("function_definition").map((node) => node.childForFieldName("name")?.text))
+  const written = (node: Node): Set<string> => {
+    const assignments = [...(node.type === "variable_assignment" ? [node] : []), ...node.descendantsOfType("variable_assignment")]
+    const names = new Set(assignments.map(assignmentName).filter((name): name is string => Boolean(name)))
+    if (assignments.some((assignment) => !assignmentName(assignment))) names.add("*")
+    if ([...(node.type === "declaration_command" ? [node] : []), ...node.descendantsOfType("declaration_command")].some((declaration) => !/^export\s/.test(declaration.text) || declaration.namedChildren.some((child) => child.type !== "variable_assignment"))) names.add("*")
+    for (const loop of node.descendantsOfType("for_statement")) {
+      const name = loop.childForFieldName("variable")?.text
+      if (name) names.add(name)
+    }
+    for (const unset of [...(node.type === "unset_command" ? [node] : []), ...node.descendantsOfType("unset_command")]) for (const child of unset.namedChildren) names.add(child.text)
+    // read options, arrays, namerefs, eval/source and function side effects are
+    // deliberately not interpreted. Invalidate the whole snapshot instead.
+    if ([...(node.type === "command" ? [node] : []), ...node.descendantsOfType("command")].some((cmd) => UNKNOWN_VARIABLE_WRITERS.has(bashCommandParts(cmd)[0]?.text) || functions.has(bashCommandParts(cmd)[0]?.text))) names.add("*")
+    return names
+  }
+  const invalidate = (variables: Variables, names: Set<string>) => {
+    if (names.has("*")) variables.clear()
+    else for (const name of names) variables.delete(name)
+  }
+  const assign = (node: Node, variables: Variables, uncertain: boolean) => {
+    const name = assignmentName(node)
+    if (!name) { variables.clear(); return }
+    const value = node.childForFieldName("value")
+    const decoded = value ? expandedWords(value.text, new Map(), true) : [""]
+    // += depends on an earlier value; arrays/indirection are not literals.
+    if (uncertain || !decoded || node.text.includes("+=") || value?.type === "array") variables.delete(name)
+    else variables.set(name, decoded)
+  }
+  const visit = (node: Node, variables: Variables, uncertain = false): void => {
+    if (node.type === "declaration_command" && (!/^export(?:\s|$)/.test(node.text) || node.namedChildren.some((child) => child.type !== "variable_assignment"))) {
+      variables.clear()
+      for (const child of node.namedChildren) visit(child, new Map(), true)
+      return
+    }
+    if (["expansion", "arithmetic_expansion"].includes(node.type)) {
+      variables.clear()
+      for (const child of node.namedChildren) visit(child, new Map(), true)
+      return
+    }
+    if (node.type === "variable_assignment") {
+      for (const child of node.namedChildren) visit(child, new Map(variables), uncertain)
+      assign(node, variables, uncertain)
+      return
+    }
+    if (node.type === "command") {
+      // Shell expands command arguments before installing command-prefix
+      // assignments. They must not override the snapshot used by rm or cd.
+      result.set(node.id, new Map(variables))
+      const nested = new Map(variables)
+      for (const child of node.namedChildren) {
+        // Prefix values are not visible during argument expansion. Still
+        // visit their substitutions for nested permission checks.
+        if (child.type === "variable_assignment") {
+          for (const part of child.namedChildren) visit(part, new Map(variables), uncertain)
+        } else visit(child, nested, uncertain)
+      }
+      const mutations = node.descendantsOfType(["expansion", "arithmetic_expansion"])
+      if (mutations.length) variables.clear()
+      const name = bashCommandParts(node)[0]?.text
+      if (name && (UNKNOWN_VARIABLE_WRITERS.has(name) || functions.has(name))) variables.clear()
+      return
+    }
+    if (node.type === "unset_command") {
+      invalidate(variables, new Set(node.namedChildren.map((child) => child.text)))
+      return
+    }
+    if (["subshell", "command_substitution", "process_substitution", "pipeline"].includes(node.type)) {
+      for (const child of node.namedChildren) visit(child, new Map(variables), true)
+      // Do not carry names written in ambiguous shell contexts forward.
+      invalidate(variables, written(node))
+      return
+    }
+    if (["function_definition", "for_statement", "c_style_for_statement", "while_statement", "if_statement", "case_statement"].includes(node.type)) {
+      const names = written(node)
+      const inner = node.type === "function_definition" ? new Map<string, readonly string[]>() : new Map(variables)
+      invalidate(inner, names)
+      if (node.type === "for_statement") {
+        const name = node.childForFieldName("variable")?.text
+        const words = node.childrenForFieldName("value")
+        const values = words.map((word) => expandedWords(word.text, new Map(), true))
+        // A body write/read can replace the loop variable before an rm.
+        const body = node.childForFieldName("body")
+        const bodyWrites = body ? written(body) : new Set(["*"])
+        const loopValues = values.flatMap((value) => value ?? [])
+        if (name && words.length && loopValues.length <= 128 && values.every(Boolean) && !bodyWrites.has(name) && !bodyWrites.has("*") && !names.has("*")) inner.set(name, loopValues)
+      }
+      for (const child of node.namedChildren) visit(child, inner, true)
+      invalidate(variables, names)
+      return
+    }
+    if (node.type === "list" && [node, ...node.descendantsOfType("list")].some((list) => list.children.some((child) => child.text === "||"))) {
+      const inner = new Map(variables)
+      invalidate(inner, written(node))
+      for (const child of node.namedChildren) visit(child, new Map(inner), true)
+      invalidate(variables, written(node))
+      return
+    }
+    for (let i = 0; i < node.childCount; i++) {
+      const child = node.child(i)
+      if (!child?.isNamed) continue
+      if (node.child(i + 1)?.text === "&") {
+        visit(child, new Map(variables), true)
+        invalidate(variables, written(child))
+      } else visit(child, variables, uncertain)
+    }
+  }
+  visit(root, new Map(), root.hasError)
+  return result
+}
+
+function absoluteOperand(raw: string, cwd: string | undefined, decoded?: string): string | undefined {
+  let value = decoded ?? literalWord(raw)
   if (!value) return
   if (value.startsWith("~")) {
-    // Quoted/escaped tildes are literal; ~user requires runtime lookup.
-    if (raw !== value || !(value === "~" || value.startsWith("~/"))) return
+    // Quoted/escaped tildes and expanded variables are literal, not home.
+    if (decoded !== undefined || raw !== value || !(value === "~" || value.startsWith("~/"))) return
     value = homedir() + value.slice(1)
   }
   if (!posix.isAbsolute(value)) {
     if (!cwd || !posix.isAbsolute(cwd)) return
-    // Do not normalize across glob components before considering expansion.
     value = cwd.replace(/\/$/, "") + "/" + value
   }
   const glob = /[?*[]/.exec(value)
@@ -474,27 +635,31 @@ function commandArguments(node: Node): Node[] {
   return node.childrenForFieldName("argument")
 }
 
-function changedDirectory(node: Node, cwd: string | undefined): string | undefined {
+function changedDirectory(node: Node, cwd: string | undefined, variables: Variables): string | undefined {
   const args = commandArguments(node).map((arg) => arg.text)
   if (args[0] === "--") args.shift()
   if (args.length !== 1 || args[0] === "-" || /[?*[]/.test(args[0])) return
-  return absoluteOperand(args[0], cwd)
+  const values = expandedWords(args[0], variables)
+  if (values?.length !== 1) return
+  if (/[?*[]/.test(values[0])) return
+  return absoluteOperand(args[0], cwd) ?? absoluteOperand(args[0], cwd, values[0])
 }
 
 /** Child shells never leak cwd; ambiguous control flow invalidates it. */
-function commandDirectories(root: Node, initial: string | undefined): Map<number, string | undefined> {
+function commandDirectories(root: Node, initial: string | undefined, variables: Map<number, Variables>): Map<number, string | undefined> {
   const directories = new Map<number, string | undefined>()
   const functions = new Set(root.descendantsOfType("function_definition").map((node) => node.childForFieldName("name")?.text))
+  const dynamicCwd = new Set(["eval", "source", ".", "builtin", "command"])
   const changesCwd = (node: Node) => node.descendantsOfType("command").some((item) =>
-    CWD_ONLY_COMMANDS.has(bashCommandParts(item)[0]?.text ?? "") || functions.has(bashCommandParts(item)[0]?.text),
+    CWD_ONLY_COMMANDS.has(bashCommandParts(item)[0]?.text ?? "") || dynamicCwd.has(bashCommandParts(item)[0]?.text ?? "") || functions.has(bashCommandParts(item)[0]?.text),
   )
   const visit = (node: Node, cwd: string | undefined): string | undefined => {
     if (node.type === "command") {
       directories.set(node.id, cwd)
       for (const child of node.namedChildren) visit(child, cwd)
       const name = bashCommandParts(node)[0]?.text
-      if (name === "cd" || name === "chdir") return changedDirectory(node, cwd)
-      return name && (CWD_ONLY_COMMANDS.has(name) || functions.has(name)) ? undefined : cwd
+      if (name === "cd" || name === "chdir") return changedDirectory(node, cwd, variables.get(node.id) ?? new Map())
+      return name && (CWD_ONLY_COMMANDS.has(name) || dynamicCwd.has(name) || functions.has(name)) ? undefined : cwd
     }
     if (["subshell", "command_substitution", "process_substitution", "pipeline"].includes(node.type)) {
       if (node.type === "pipeline") for (const child of node.namedChildren) visit(child, cwd)
@@ -534,7 +699,32 @@ function commandDirectories(root: Node, initial: string | undefined): Map<number
   return directories
 }
 
-function rmPatterns(node: Node, cwd: string | undefined): string[] | undefined {
+/** Unknown marker access never enables the project namespace. */
+function hasGitEntry(directory: string): boolean | undefined {
+  try { lstatSync(posix.join(directory, ".git")); return true }
+  catch (error) {
+    if (["ENOENT", "ENOTDIR"].includes((error as NodeJS.ErrnoException).code ?? "")) return false
+    return undefined
+  }
+}
+
+function validatedProjectRoot(root: string | undefined): string | undefined {
+  if (!root || !posix.isAbsolute(root)) return
+  const normalized = posix.normalize(root).replace(/\/$/, "") || "/"
+  if (normalized === "/" || normalized === homedir() || hasGitEntry(normalized) !== true) return
+  return normalized
+}
+
+function projectOperand(absolute: string, root: string | undefined): string {
+  if (!root || !absolute.startsWith(root + "/")) return absolute
+  const relative = absolute.slice(root.length + 1)
+  if (!relative || relative.split("/").includes(".git") || /[?*[]/.test(relative)) return absolute
+  // A .git file also identifies a linked Git worktree root.
+  if (hasGitEntry(absolute) !== false) return absolute
+  return "project:" + relative
+}
+
+function rmPatterns(node: Node, cwd: string | undefined, variables: Variables, projectRoot: string | undefined): string[] | undefined {
   const options: string[] = []
   const operands: string[] = []
   let ended = false
@@ -545,7 +735,12 @@ function rmPatterns(node: Node, cwd: string | undefined): string[] | undefined {
       ended = true
       options.push(raw)
     } else if (!ended && value?.startsWith("-") && value !== "-") options.push(value)
-    else operands.push(absoluteOperand(raw, cwd) ?? raw)
+    else {
+      const values = expandedWords(raw, variables)
+      const resolved = values?.map((value) => absoluteOperand(raw, cwd) ?? absoluteOperand(raw, cwd, value))
+      if (!resolved?.length || resolved.some((value) => !value)) operands.push(raw)
+      else operands.push(...resolved.map((value) => projectOperand(value!, projectRoot)))
+    }
   }
   if (!operands.length) return
   return operands.map((operand) => ["rm", ...options, operand].join(" "))
@@ -572,14 +767,16 @@ export async function buildBashPermissionRequest(command: string, options: BashP
     const root = tree.rootNode
     const nodes = root.descendantsOfType("command")
     const commands = nodes.map(parsedCommand)
-    const directories = scope ? new Map<number, string | undefined>() : commandDirectories(root, root.hasError ? undefined : options.cwd)
+    const variables = scope ? new Map<number, Variables>() : commandVariables(root)
+    const projectRoot = !scope && !root.hasError ? validatedProjectRoot(options.projectRoot) : undefined
+    const directories = scope ? new Map<number, string | undefined>() : commandDirectories(root, root.hasError ? undefined : options.cwd, variables)
     const patterns: string[] = []
     const always: string[] = []
     for (let i = 0; i < nodes.length; i++) {
       const item = commands[i]
       const name = item.tokens[0]
       if (!item.tokens.length || (name && CWD_ONLY_COMMANDS.has(name))) continue
-      const resolved = !scope && name === "rm" ? rmPatterns(nodes[i], directories.get(nodes[i].id)) : undefined
+      const resolved = !scope && name === "rm" ? rmPatterns(nodes[i], directories.get(nodes[i].id), variables.get(nodes[i].id) ?? new Map(), projectRoot) : undefined
       patterns.push(...(resolved ?? [item.source]).map((rule) => prefixRule(scope, rule)))
       always.push(prefixRule(scope, bashArityPrefix(item.tokens).join(" ") + " *"))
     }
