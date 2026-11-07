@@ -46,7 +46,7 @@ curl -fsSL https://raw.githubusercontent.com/samiralibabic/opencode-rexd-target/
 Pinned version:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/samiralibabic/opencode-rexd-target/main/scripts/install.sh | OPENCODE_REXD_TARGET_VERSION=v0.3.12 bash
+curl -fsSL https://raw.githubusercontent.com/samiralibabic/opencode-rexd-target/main/scripts/install.sh | OPENCODE_REXD_TARGET_VERSION=v0.3.13 bash
 ```
 
 The installer places files in your OpenCode config directory:
@@ -92,7 +92,27 @@ Example `~/.config/rexd/targets.json`:
 
 The plugin preserves OpenCode's `bash` permission policy. Local fallback uses native-style command families such as `git log *`. Remote permission patterns use the same families inside a target-specific namespace, so an approval for one target cannot authorize local execution or another target. Broad `bash` policies (`allow`, `ask`, or `deny`) still apply; command-specific remote rules use the namespaced pattern shown in OpenCode's approval dialog.
 
-Bash checks walk every Tree-sitter command node, including commands nested in substitutions, groups, loops, and functions. For local execution, each rm operand gets its own permission pattern: literal paths are resolved lexically against the tool cwd and earlier literal cd commands in successful && chains. Variables and other dynamic operands remain unchanged; ambiguous directory changes stay unresolved. Path normalization does not follow symlinks. Remote checks retain their original source text and target namespace without local path resolution.
+Bash checks walk every Tree-sitter command node, including commands nested in substitutions, groups, loops, and functions. For local execution, each rm operand gets its own permission pattern: literal paths are resolved lexically against the tool cwd and earlier literal cd commands in successful && chains. In v0.3.12, variables and other dynamic operands remain unchanged; ambiguous directory changes stay unresolved. Path normalization does not follow symlinks. Remote checks retain their original source text and target namespace without local path resolution.
+
+In v0.3.13, local rm and cd operands can also use literal same-command-line assignments ($NAME or ${NAME}); plain export assignments are supported. Prefix assignments are command-local and do not replace values expanded by the shell before that command starts. Only literal for-in lists expand to one rm pattern per word. Environment-only names, substitutions, ambiguous writes/control flow, and nonliteral loop lists stay unresolved; nothing is executed to resolve them.
+
+A local resolved rm operand strictly inside the session's verified Git top level (OpenCode's context.worktree) uses rm <options> project:<relative path>. This includes files below .worktrees/<name>/, but not the project root itself, any .git segment, a directory with its own .git entry (including linked-worktree roots), or a glob-bearing path (which cannot be checked for repository markers before expansion). Outside paths remain absolute. The filesystem marker is checked at permission time; /, home, and directories without .git cannot enable project patterns. Resolution is lexical, does not follow symlinks, and is not a filesystem sandbox or a guarantee against concurrent filesystem changes. Remote patterns and /tmp/agents behavior are unchanged.
+
+To allow recursive deletes of project contents while preserving recursive-delete asks elsewhere, append these entries **in this order at the end of permission.bash**, after existing recursive-rm ask rules (OpenCode uses the last matching anchored glob):
+
+```json
+{
+  "rm -r* project:?*": "allow",
+  "rm -R* project:?*": "allow",
+  "rm -?r* project:?*": "allow",
+  "rm -?R* project:?*": "allow",
+  "rm * project:*..*": "ask",
+  "rm * project:*$*": "ask",
+  "rm * project:*`*": "ask"
+}
+```
+
+The project: prefix is a permission namespace, not a shell path. Existing absolute-path rm rules do not match it; review path-specific policy exceptions before opting in. Multi-operand rm commands still require every generated pattern to be allowed. No configuration is changed automatically.
 
 Subagents resolve target state through their live OpenCode parent-session chain on every operation. The nearest explicit state wins, parent target changes are visible on the child's next operation, and corrupt ancestor state fails closed.
 
@@ -127,7 +147,7 @@ Update commands:
 curl -fsSL https://raw.githubusercontent.com/samiralibabic/rexd/main/scripts/install.sh | REXD_VERSION=v0.1.5 bash
 
 # 2) local plugin
-curl -fsSL https://raw.githubusercontent.com/samiralibabic/opencode-rexd-target/main/scripts/install.sh | OPENCODE_REXD_TARGET_VERSION=v0.3.12 bash
+curl -fsSL https://raw.githubusercontent.com/samiralibabic/opencode-rexd-target/main/scripts/install.sh | OPENCODE_REXD_TARGET_VERSION=v0.3.13 bash
 ```
 
 If you update the plugin before `rexd`, remote `edit`/`apply_patch` calls can fail with method-not-found errors on older servers.

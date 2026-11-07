@@ -1,3 +1,5 @@
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs"
+import { posix } from "node:path"
 import { homedir } from "node:os"
 import { describe, expect, spyOn, test } from "bun:test"
 import { Parser } from "web-tree-sitter"
@@ -367,4 +369,89 @@ done`
     expect(remote.patterns).toEqual(request.patterns.map((pattern) => "remote:test:" + pattern))
   })
 
+})
+
+describe("literal variables and project-local rm permissions", () => {
+  const deletes = async (command: string, options = {}) => (await buildBashPermissionRequest(command, options)).patterns.filter((pattern) => pattern.startsWith("rm "))
+
+  test("tracks assignments, export, reassignment, braced expansions, and cd", async () => {
+    for (const separator of [";", "&&", "\n"]) {
+      expect(await deletes('A=/tmp/agents/x' + separator + ' rm -rf $A/after')).toEqual(["rm -rf /tmp/agents/x/after"])
+    }
+    expect(await deletes('export A=/tmp/agents/x; rm -rf "${A}/after"')).toEqual(["rm -rf /tmp/agents/x/after"])
+    expect(await deletes('A=/outside; A=/tmp/agents/x; rm -rf ${A}/after')).toEqual(["rm -rf /tmp/agents/x/after"])
+    expect(await deletes('A="/tmp/agents/two words"; rm -rf "$A/after"')).toEqual(["rm -rf /tmp/agents/two words/after"])
+    expect(await deletes('A=/tmp/agents/x; cd $A && rm -rf after')).toEqual(["rm -rf /tmp/agents/x/after"])
+  })
+
+  test("command-prefix assignments do not leak or override argument expansion", async () => {
+    expect(await deletes('A=/tmp/agents/x echo ok; rm -rf $A/after')).toEqual(["rm -rf $A/after"])
+    expect(await deletes('A=/outside; A=/tmp/agents/x rm -rf $A/after; rm -rf $A/again')).toEqual(["rm -rf /outside/after", "rm -rf /outside/again"])
+    expect(await deletes('A=/tmp/agents/x rm -rf $A/after')).toEqual(["rm -rf $A/after"])
+  })
+
+  test("invalidates uncertain writes and never uses environment values", async () => {
+    for (const middle of ["unset A", "read A", "A=$(pwd)", "A=$HOME", "A+=other", "if true; then A=/tmp/agents/x; fi", "for n in a; do A=/tmp/agents/x; done", "case x in x) A=/tmp/agents/x;; esac", "(A=/tmp/agents/x)"]) {
+      expect(await deletes('A=/outside; ' + middle + '; rm -rf $A/after')).toEqual(["rm -rf $A/after"])
+    }
+    expect(await deletes('rm -rf $HOME/x')).toEqual(["rm -rf $HOME/x"])
+    expect(await deletes('A=/outside; if true; then A=/tmp/agents/x; rm -rf $A; fi')).toEqual(["rm -rf $A"])
+    expect(await deletes('A=/outside; A=/tmp/agents/x || true; rm -rf $A')).toEqual(["rm -rf $A"])
+    expect(await deletes('A=/outside; f() { A=/tmp/agents/x; }; f; rm -rf $A')).toEqual(["rm -rf $A"])
+  })
+
+  test("expands literal for-in words only and keeps body writes unknown", async () => {
+    expect(await deletes('for d in a b c; do mkdir -p $d; rm -rf "/path/$d/before"; done')).toEqual(["rm -rf /path/a/before", "rm -rf /path/b/before", "rm -rf /path/c/before"])
+    for (const words of ["a *", "a $(printf b)", "a $ENV", "a {b,c}"]) {
+      expect(await deletes('for d in ' + words + '; do rm -rf /path/$d/before; done')).toEqual(["rm -rf /path/$d/before"])
+    }
+    expect(await deletes('for d in a b; do A=/tmp/agents/x; rm -rf $A; done')).toEqual(["rm -rf $A"])
+    expect(await deletes('for d in a b; do d=x; rm -rf /path/$d; done')).toEqual(["rm -rf /path/$d"])
+    expect(await deletes('for d in a b; do echo $d; done; rm -rf /path/$d')).toEqual(["rm -rf /path/$d"])
+  })
+
+  test("emits project paths only strictly within a verified session git root", async () => {
+    const root = mkdtempSync('/tmp/agents/rexd-project-rm/test-project-')
+    try {
+      mkdirSync(root + '/.git')
+      mkdirSync(root + '/.worktrees/x/sub', { recursive: true })
+      writeFileSync(root + '/.worktrees/x/.git', 'gitdir: fixture')
+      mkdirSync(root + '/nested/.git', { recursive: true })
+      const options = { cwd: root, projectRoot: root }
+      expect(await deletes('rm -rf apps/x/build', options)).toEqual(['rm -rf project:apps/x/build'])
+      expect(await deletes('rm -rf ' + root + '/.worktrees/x/sub', options)).toEqual(['rm -rf project:.worktrees/x/sub'])
+      expect(await deletes('cd ' + root + '/.worktrees/x && rm -rf apps/dashboard/zz-shots', options)).toEqual(['rm -rf project:.worktrees/x/apps/dashboard/zz-shots'])
+      for (const suffix of ['', '/', '/.git', '/.git/config', '/.worktrees/x', '/.worktrees/x/', '/nested', '/*', '/a*', '/a/.git/config', '/../other']) {
+        const absolute = root + suffix
+        const normalized = suffix === '/../other' ? posix.normalize(absolute) : absolute
+        expect(await deletes('rm -rf ' + absolute, options)).toEqual(['rm -rf ' + normalized])
+      }
+      expect(await deletes('rm -rf ' + root + '/apps/*', options)).toEqual(['rm -rf ' + root + '/apps/*'])
+      expect(await deletes('rm -rf /outside/build', options)).toEqual(['rm -rf /outside/build'])
+      for (const projectRoot of ['/', homedir(), root + '/missing']) {
+        expect(await deletes('rm -rf apps/build', { cwd: root, projectRoot })).toEqual(['rm -rf ' + root + '/apps/build'])
+      }
+      expect((await buildBashPermissionRequest('A=' + root + '; rm -rf $A/apps/build', { ...options, remoteScope: 'remote:test:' })).patterns).toEqual(['remote:test:rm -rf $A/apps/build'])
+    } finally { rmSync(root, { recursive: true, force: true }) }
+  })
+})
+
+describe("ambiguous variable joins", () => {
+  test("does not carry background, OR-chain, read, or declaration writes", async () => {
+    const commands = [
+      'A=/outside; A=/tmp/agents/x & rm -rf $A',
+      'A=/outside; true || A=/tmp/agents/x && rm -rf $A',
+      'A=/outside; true && A=/tmp/agents/x || true; rm -rf $A',
+      'A=/outside; for d in a b; do read A; rm -rf $A; done',
+      'A=/outside; declare -n A=B; rm -rf $A',
+      'A=/outside; printf -v A /tmp/agents/x; rm -rf $A',
+      'A=/outside; let A=1; rm -rf $A',
+      'A=/outside; if true; then declare -n A=B; fi; rm -rf $A',
+    ]
+    for (const command of commands) expect((await buildBashPermissionRequest(command)).patterns).toContain('rm -rf $A')
+  })
+  test("does not resolve word splitting or glob-valued loop lists", async () => {
+    expect((await buildBashPermissionRequest('A="/tmp/agents/a b"; rm -rf $A')).patterns).toContain('rm -rf $A')
+    expect((await buildBashPermissionRequest('for d in a "*"; do rm -rf /path/$d; done')).patterns).toContain('rm -rf /path/$d')
+  })
 })

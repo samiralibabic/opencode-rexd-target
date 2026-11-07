@@ -621,6 +621,19 @@ done`
     })
   })
 
+  test("uses the session worktree rather than tool cwd as the project permission root", async () => {
+    const project = tempDir()
+    mkdirSync(join(project, ".git"))
+    const directory = join(project, ".worktrees", "example", "apps")
+    mkdirSync(directory, { recursive: true })
+    writeFileSync(join(project, ".worktrees", "example", ".git"), "gitdir: fixture")
+    const { context, asks } = mockContext(directory, project)
+    await askBashPermission(context as any, "rm -rf build", directory)
+    expect(asks.find((ask) => ask.permission === "bash")).toMatchObject({
+      patterns: ["rm -rf project:.worktrees/example/apps/build"],
+    })
+  })
+
   test("isolates remote bash approvals from local execution and other targets", async () => {
     const command = "git log --oneline"
     const local = mockContext(tempDir())
