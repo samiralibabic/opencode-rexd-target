@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.3.16 - 2026-11-09
+
+- Emit the `project:` permission namespace only for local rm operands that were resolved to a path strictly inside the session's Git root. Unresolved operands (for example after `cd "$X"`), options, and whole-line fallbacks now write any `project:` text as `project%3A`, so they can no longer match project allow rules; recursive deletes of such operands ask like any other unresolved operand.
+- A relative file literally named `project:foo` keeps resolving like any other operand: `project:project:foo` inside the project, an absolute path outside it.
+
 ## v0.3.15 - 2026-11-09
 
 - Percent-encode whitespace (and a literal %) inside each resolved local rm operand, so a quoted or escaped path with spaces or tabs yields one pattern token: allow rules for the scratch area and project paths match it, and rules aimed at several paths in one pattern no longer misread it.

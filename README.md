@@ -46,7 +46,7 @@ curl -fsSL https://raw.githubusercontent.com/samiralibabic/opencode-rexd-target/
 Pinned version:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/samiralibabic/opencode-rexd-target/main/scripts/install.sh | OPENCODE_REXD_TARGET_VERSION=v0.3.15 bash
+curl -fsSL https://raw.githubusercontent.com/samiralibabic/opencode-rexd-target/main/scripts/install.sh | OPENCODE_REXD_TARGET_VERSION=v0.3.16 bash
 ```
 
 The installer places files in your OpenCode config directory:
@@ -114,6 +114,8 @@ To allow recursive deletes of project contents while preserving recursive-delete
 
 From v0.3.15, whitespace inside one resolved rm operand is percent-encoded in its pattern (%20 for a space, %09 for a tab, %0A for a newline), and a literal % becomes %25. A space in a local rm pattern therefore only separates rm, its options, and its single operand, so `rm -rf "/tmp/agents/x/a b"` yields `rm -rf /tmp/agents/x/a%20b` and `rm -rf "docs/my file.txt"` inside the project yields `rm -rf project:docs/my%20file.txt`. Unresolved operands, whole-line fallbacks, and remote patterns keep their source text, so rules that match several paths in one pattern still apply to them.
 
+From v0.3.16, only a resolved operand proven to be strictly inside the project uses the project: prefix. In local unresolved operands, options, and fallbacks, any `project:` text is written as `project%3A`, so `cd "$X" && rm -rf project:foo` yields `rm -rf project%3Afoo` and still asks under the rules above. A relative file literally named `project:foo` resolves like any other operand, for example to `project:project:foo` inside the project.
+
 The project: prefix is a permission namespace, not a shell path. Existing absolute-path rm rules do not match it; review path-specific policy exceptions before opting in. Multi-operand rm commands still require every generated pattern to be allowed. No configuration is changed automatically.
 
 Subagents resolve target state through their live OpenCode parent-session chain on every operation. The nearest explicit state wins, parent target changes are visible on the child's next operation, and corrupt ancestor state fails closed.
@@ -149,7 +151,7 @@ Update commands:
 curl -fsSL https://raw.githubusercontent.com/samiralibabic/rexd/main/scripts/install.sh | REXD_VERSION=v0.1.5 bash
 
 # 2) local plugin
-curl -fsSL https://raw.githubusercontent.com/samiralibabic/opencode-rexd-target/main/scripts/install.sh | OPENCODE_REXD_TARGET_VERSION=v0.3.15 bash
+curl -fsSL https://raw.githubusercontent.com/samiralibabic/opencode-rexd-target/main/scripts/install.sh | OPENCODE_REXD_TARGET_VERSION=v0.3.16 bash
 ```
 
 If you update the plugin before `rexd`, remote `edit`/`apply_patch` calls can fail with method-not-found errors on older servers.
