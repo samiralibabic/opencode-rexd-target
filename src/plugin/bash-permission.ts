@@ -733,6 +733,16 @@ function patternOperand(operand: string): string {
   return operand.replace(/[%\s]/g, (char) => encodeURIComponent(char))
 }
 
+/**
+ * Only projectOperand emits the project: namespace, for a path it proved to be
+ * strictly inside the session's Git root. Unresolved operands, options and
+ * fallbacks write it as project%3A, so an unknown cwd, quoting, or a name
+ * after an escaped space can never match a project allow rule.
+ */
+function unprovenText(text: string): string {
+  return text.replace(/(project):/gi, "$1%3A")
+}
+
 function rmPatterns(node: Node, cwd: string | undefined, variables: Variables, projectRoot: string | undefined): string[] | undefined {
   const options: string[] = []
   const operands: string[] = []
@@ -743,11 +753,11 @@ function rmPatterns(node: Node, cwd: string | undefined, variables: Variables, p
     if (!ended && value === "--") {
       ended = true
       options.push(raw)
-    } else if (!ended && value?.startsWith("-") && value !== "-") options.push(value)
+    } else if (!ended && value?.startsWith("-") && value !== "-") options.push(unprovenText(value))
     else {
       const values = expandedWords(raw, variables)
       const resolved = values?.map((value) => absoluteOperand(raw, cwd) ?? absoluteOperand(raw, cwd, value))
-      if (!resolved?.length || resolved.some((value) => !value)) operands.push(raw)
+      if (!resolved?.length || resolved.some((value) => !value)) operands.push(unprovenText(raw))
       else operands.push(...resolved.map((value) => patternOperand(projectOperand(value!, projectRoot))))
     }
   }
@@ -786,12 +796,13 @@ export async function buildBashPermissionRequest(command: string, options: BashP
       const name = item.tokens[0]
       if (!item.tokens.length || (name && CWD_ONLY_COMMANDS.has(name))) continue
       const resolved = !scope && name === "rm" ? rmPatterns(nodes[i], directories.get(nodes[i].id), variables.get(nodes[i].id) ?? new Map(), projectRoot) : undefined
-      patterns.push(...(resolved ?? [item.source]).map((rule) => prefixRule(scope, rule)))
+      patterns.push(...(resolved ?? [!scope && name === "rm" ? unprovenText(item.source) : item.source]).map((rule) => prefixRule(scope, rule)))
       always.push(prefixRule(scope, bashArityPrefix(item.tokens).join(" ") + " *"))
     }
     if (root.hasError && uncoveredError(root, nodes)) {
-      patterns.push(prefixRule(scope, command))
-      always.push(prefixRule(scope, command))
+      const fallback = scope ? command : unprovenText(command)
+      patterns.push(prefixRule(scope, fallback))
+      always.push(prefixRule(scope, fallback))
     }
     return { patterns: unique(patterns), always: unique(always), commands, unsupported: root.hasError }
   } finally {

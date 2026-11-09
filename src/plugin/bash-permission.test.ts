@@ -551,4 +551,52 @@ describe("whitespace inside one rm operand", () => {
       'echo ok & ; rm -rf "/tmp/agents/x/a b" /etc',
     ]) expect(await decide(command, { cwd: "/outside" })).toBe("ask")
   })
+
+  test("emits the project: namespace only for operands proven to be inside the project", async () => {
+    const root = mkdtempSync(join(tmpdir(), "rexd-unproven-"))
+    try {
+      mkdirSync(root + "/.git")
+      mkdirSync(root + "/sub")
+      writeFileSync(root + "/project:foo", "")
+      writeFileSync(root + "/sub/project:foo", "")
+      const project = { cwd: root, projectRoot: root }
+      const unproven: [string, object, string[]][] = [
+        // An unknown working directory leaves the operand unresolved.
+        ['cd "$X" && rm -rf project:foo', project, ["rm -rf project%3Afoo"]],
+        ['cd "$X" && rm -rf project:foo', { cwd: "/outside" }, ["rm -rf project%3Afoo"]],
+        ['rm -rf project:foo', {}, ["rm -rf project%3Afoo"]],
+        ['rm -rf "project:foo"', {}, ['rm -rf "project%3Afoo"']],
+        ['rm -rf project\\:foo', {}, ["rm -rf project\\:foo"]],
+        ['rm -rf project:"foo"', {}, ['rm -rf project%3A"foo"']],
+        ['rm -rf PROJECT:foo', {}, ["rm -rf PROJECT%3Afoo"]],
+        ['rm -Rf project:foo', {}, ["rm -Rf project%3Afoo"]],
+        ['rm -fr project:foo', {}, ["rm -fr project%3Afoo"]],
+        // Text after quoted or escaped whitespace inside one unresolved operand.
+        ['rm -rf "a project:foo"', {}, ['rm -rf "a project%3Afoo"']],
+        ['rm -rf a\\ project:foo', {}, ["rm -rf a\\ project%3Afoo"]],
+        ['rm -rf "/tmp/agents/$x project:y"', {}, ['rm -rf "/tmp/agents/$x project%3Ay"']],
+        // Options, recovered commands, and whole-line fallbacks.
+        ['rm -r"f project:x" /etc', {}, ["rm -rf project%3Ax /etc"]],
+        ['rm -rf project:foo )', {}, ["rm -rf project%3Afoo", "rm -rf project%3Afoo )"]],
+      ]
+      for (const [command, options, patterns] of unproven) {
+        expect((await buildBashPermissionRequest(command, options)).patterns).toEqual(patterns)
+        expect(await decide(command, options)).toBe("ask")
+      }
+
+      // A real file named project:foo resolves like any other relative operand.
+      expect((await buildBashPermissionRequest("rm -rf project:foo", project)).patterns).toEqual(["rm -rf project:project:foo"])
+      expect(await decide("rm -rf project:foo", project)).toBe("allow")
+      expect((await buildBashPermissionRequest("cd sub && rm -rf project:foo", project)).patterns).toEqual(["rm -rf project:sub/project:foo"])
+      expect(await decide("cd sub && rm -rf project:foo", project)).toBe("allow")
+      expect((await buildBashPermissionRequest("rm -rf " + root + "/project:foo", project)).patterns).toEqual(["rm -rf project:project:foo"])
+      expect((await buildBashPermissionRequest("rm -rf project:foo", { cwd: "/outside", projectRoot: root })).patterns).toEqual(["rm -rf /outside/project:foo"])
+      expect(await decide("rm -rf project:foo", { cwd: "/outside", projectRoot: root })).toBe("ask")
+      expect((await buildBashPermissionRequest("rm -rf project:foo", { cwd: root })).patterns).toEqual(["rm -rf " + root + "/project:foo"])
+      expect(await decide("rm -rf project:foo", { cwd: root })).toBe("ask")
+
+      // Remote patterns keep their source text and never match local rules.
+      expect((await buildBashPermissionRequest("rm -rf project:foo", { remoteScope: "remote:test:" })).patterns).toEqual(["remote:test:rm -rf project:foo"])
+    } finally { rmSync(root, { recursive: true, force: true }) }
+  })
 })
