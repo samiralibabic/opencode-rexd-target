@@ -12,6 +12,8 @@ import {
 
 // Mirrors OpenCode 1.18.4's anchored wildcard semantics for approval-boundary tests.
 function matches(input: string, pattern: string): boolean {
+  input = input.replaceAll("\\", "/")
+  pattern = pattern.replaceAll("\\", "/")
   let escaped = pattern
     .replace(/[.+^${}()|[\]\\]/g, "\\$&")
     .replace(/\*/g, ".*")
@@ -380,7 +382,7 @@ describe("literal variables and project-local rm permissions", () => {
     }
     expect(await deletes('export A=/tmp/agents/x; rm -rf "${A}/after"')).toEqual(["rm -rf /tmp/agents/x/after"])
     expect(await deletes('A=/outside; A=/tmp/agents/x; rm -rf ${A}/after')).toEqual(["rm -rf /tmp/agents/x/after"])
-    expect(await deletes('A="/tmp/agents/two words"; rm -rf "$A/after"')).toEqual(["rm -rf /tmp/agents/two words/after"])
+    expect(await deletes('A="/tmp/agents/two words"; rm -rf "$A/after"')).toEqual(["rm -rf /tmp/agents/two%20words/after"])
     expect(await deletes('A=/tmp/agents/x; cd $A && rm -rf after')).toEqual(["rm -rf /tmp/agents/x/after"])
   })
 
@@ -453,5 +455,100 @@ describe("ambiguous variable joins", () => {
   test("does not resolve word splitting or glob-valued loop lists", async () => {
     expect((await buildBashPermissionRequest('A="/tmp/agents/a b"; rm -rf $A')).patterns).toContain('rm -rf $A')
     expect((await buildBashPermissionRequest('for d in a "*"; do rm -rf /path/$d; done')).patterns).toContain('rm -rf /path/$d')
+  })
+})
+
+describe("whitespace inside one rm operand", () => {
+  // A documented scratch and project recursive-delete policy, in order, after
+  // OpenCode's default `*` allow. Multi-path asks stay for fallback patterns.
+  const policy: [string, "allow" | "ask"][] = [
+    ["*", "allow"],
+    ["rm -r*", "ask"], ["rm -R*", "ask"], ["rm -?r*", "ask"], ["rm -?R*", "ask"],
+    ["rm * -r*", "ask"], ["rm * -R*", "ask"], ["rm * -?r*", "ask"], ["rm * -?R*", "ask"],
+    ["rm -r* /tmp/agents/?*", "allow"], ["rm -R* /tmp/agents/?*", "allow"],
+    ["rm -?r* /tmp/agents/?*", "allow"], ["rm -?R* /tmp/agents/?*", "allow"],
+    ["rm * ?* /tmp/agents/*", "ask"], ["rm * /tmp/agents/?* ?*", "ask"],
+    ["rm * /tmp/agents/*..*", "ask"], ["rm * /tmp/agents/*$*", "ask"], ["rm * /tmp/agents/*`*", "ask"],
+    ["rm -r* project:?*", "allow"], ["rm -R* project:?*", "allow"],
+    ["rm -?r* project:?*", "allow"], ["rm -?R* project:?*", "allow"],
+    ["rm * project:*..*", "ask"], ["rm * project:*$*", "ask"], ["rm * project:*`*", "ask"],
+  ]
+  const decide = async (command: string, options = {}) => {
+    const actions = (await buildBashPermissionRequest(command, options)).patterns.map((pattern) => policy.findLast(([rule]) => matches(pattern, rule))![1])
+    return actions.includes("ask") ? "ask" : "allow"
+  }
+  const reported = '/tmp/agents/tas-974-walk3/final/after/en-1280/08-04 Angaben ergänzen – in der Einrichtung gelandet.png'
+
+  test("percent-encodes whitespace and the escape character in resolved operands", async () => {
+    expect((await buildBashPermissionRequest('rm -rf "' + reported + '"')).patterns)
+      .toEqual(["rm -rf /tmp/agents/tas-974-walk3/final/after/en-1280/08-04%20Angaben%20ergänzen%20–%20in%20der%20Einrichtung%20gelandet.png"])
+    expect((await buildBashPermissionRequest("rm -rf /tmp/agents/x/a\\ b '/tmp/agents/x/c\td' '/tmp/agents/x/e\nf'")).patterns)
+      .toEqual(["rm -rf /tmp/agents/x/a%20b", "rm -rf /tmp/agents/x/c%09d", "rm -rf /tmp/agents/x/e%0Af"])
+    expect((await buildBashPermissionRequest('rm -rf "/tmp/agents/x/my dir"/sub/file /tmp/agents/x/"c d"e')).patterns)
+      .toEqual(["rm -rf /tmp/agents/x/my%20dir/sub/file", "rm -rf /tmp/agents/x/c%20de"])
+    expect((await buildBashPermissionRequest('cd "/tmp/agents/x/two words" && rm -rf "c d"')).patterns)
+      .toEqual(["rm -rf /tmp/agents/x/two%20words/c%20d"])
+    // The escape character is encoded too, so distinct names stay distinct.
+    expect((await buildBashPermissionRequest('rm -rf "/tmp/agents/x/100% done" /tmp/agents/x/100%20done')).patterns)
+      .toEqual(["rm -rf /tmp/agents/x/100%25%20done", "rm -rf /tmp/agents/x/100%2520done"])
+    // Unresolved operands, options and remote scopes keep their source text.
+    expect((await buildBashPermissionRequest('rm -rf "/tmp/agents/x/a b/$y"')).patterns).toEqual(['rm -rf "/tmp/agents/x/a b/$y"'])
+    expect((await buildBashPermissionRequest('rm -rf "/tmp/agents/x/a b"', { remoteScope: "remote:test:" })).patterns)
+      .toEqual(['remote:test:rm -rf "/tmp/agents/x/a b"'])
+  })
+
+  test("allows one scratch or project operand whatever whitespace it contains", async () => {
+    for (const command of [
+      'rm -rf "' + reported + '"',
+      "rm -rf /tmp/agents/x/a\\ b",
+      "rm -rf '/tmp/agents/x/c\td'",
+      'rm -rf "/tmp/agents/x/my dir"/sub/file /tmp/agents/x/"c d"e',
+      'cd "/tmp/agents/x/two words" && rm -rf "c d"',
+      'A="/tmp/agents/two words"; rm -rf "$A/after"',
+    ]) expect(await decide(command, { cwd: "/outside" })).toBe("allow")
+
+    const root = mkdtempSync(join(tmpdir(), "rexd project "))
+    try {
+      mkdirSync(root + "/.git")
+      mkdirSync(root + "/nested repo/.git", { recursive: true })
+      const options = { cwd: root, projectRoot: root }
+      expect((await buildBashPermissionRequest('rm -rf "docs/my file.txt" docs/a\\ b/"c\td"', options)).patterns)
+        .toEqual(["rm -rf project:docs/my%20file.txt", "rm -rf project:docs/a%20b/c%09d"])
+      expect(await decide('rm -rf "docs/my file.txt" docs/a\\ b/"c\td"', options)).toBe("allow")
+      expect(await decide('rm -rf "' + root + '/build output"', options)).toBe("allow")
+
+      for (const command of [
+        'rm -rf "' + root + '"',
+        'rm -rf "' + root + '/.git"',
+        'rm -rf "nested repo"',
+        'rm -rf "a b"/*',
+        'rm -rf "a b/../../outside dir"',
+        "rm -rf 'a b/$x'",
+        "rm -rf 'a b/`id`'",
+        'rm -rf "docs/a b" "/outside/c d"',
+      ]) expect(await decide(command, options)).toBe("ask")
+    } finally { rmSync(root, { recursive: true, force: true }) }
+  })
+
+  test("keeps asking for paths outside the scratch area and every fallback", async () => {
+    for (const command of [
+      'rm -rf "/tmp/agents/x/a b" /etc',
+      'rm -rf "/tmp/agents/x/a b" "/outside/c d"',
+      'rm -rf / "/tmp/agents/x/a b"',
+      // One path outside the scratch area or project must not pass for a
+      // second, allowed operand because of a space in its name.
+      'rm -rf "/outside/a /tmp/agents/b"',
+      'rm -rf "/outside/a project:b"',
+      'rm -rf "/tmp/agents/x/a b/../../../etc"',
+      'rm -rf "/tmp/agents/x/a b/"*/../../etc',
+      'rm -rf "/tmp/agents/x/a b..c"',
+      "rm -rf '/tmp/agents/x/a b/$y' && rm -rf \"/tmp/agents/x/a b/$y\"",
+      "rm -rf '/tmp/agents/x/a b/`id`'",
+      'rm -rf "$X/a b"',
+      'rm -rf ~/"My Documents"',
+      'cd ~ && rm -rf "My Documents"',
+      'cd "$X" && rm -rf a\\ /tmp/agents/x',
+      'echo ok & ; rm -rf "/tmp/agents/x/a b" /etc',
+    ]) expect(await decide(command, { cwd: "/outside" })).toBe("ask")
   })
 })
