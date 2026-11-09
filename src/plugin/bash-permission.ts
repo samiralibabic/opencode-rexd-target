@@ -724,6 +724,15 @@ function projectOperand(absolute: string, root: string | undefined): string {
   return "project:" + relative
 }
 
+/**
+ * One resolved operand is one pattern token. Percent-encode whitespace and the
+ * escape character itself, so a quoted or escaped space never reads as an
+ * operand separator to rules such as `rm * /tmp/agents/?* ?*`.
+ */
+function patternOperand(operand: string): string {
+  return operand.replace(/[%\s]/g, (char) => encodeURIComponent(char))
+}
+
 function rmPatterns(node: Node, cwd: string | undefined, variables: Variables, projectRoot: string | undefined): string[] | undefined {
   const options: string[] = []
   const operands: string[] = []
@@ -739,7 +748,7 @@ function rmPatterns(node: Node, cwd: string | undefined, variables: Variables, p
       const values = expandedWords(raw, variables)
       const resolved = values?.map((value) => absoluteOperand(raw, cwd) ?? absoluteOperand(raw, cwd, value))
       if (!resolved?.length || resolved.some((value) => !value)) operands.push(raw)
-      else operands.push(...resolved.map((value) => projectOperand(value!, projectRoot)))
+      else operands.push(...resolved.map((value) => patternOperand(projectOperand(value!, projectRoot))))
     }
   }
   if (!operands.length) return

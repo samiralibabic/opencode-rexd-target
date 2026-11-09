@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.3.15 - 2026-11-09
+
+- Percent-encode whitespace (and a literal %) inside each resolved local rm operand, so a quoted or escaped path with spaces or tabs yields one pattern token: allow rules for the scratch area and project paths match it, and rules aimed at several paths in one pattern no longer misread it.
+- A single absolute path containing ` project:` or ` /tmp/agents/` in its name can no longer match a rule written for a second, allowed operand.
+- Unresolved operands, whole-line fallbacks, options, and remote patterns keep their source text.
+
 ## v0.3.14 - 2026-11-07
 
 - Same changes as v0.3.13, which was tagged but not released because a test used a machine-specific path; the test now uses the system temp directory.
