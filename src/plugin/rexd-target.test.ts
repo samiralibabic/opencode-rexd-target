@@ -935,3 +935,37 @@ describe("structured results and bash timeout compatibility", () => {
     expect(() => resolveBashTimeout({ timeout: -1 })).toThrow("Invalid timeout")
   })
 })
+
+describe("local edit diagnostics", () => {
+  test("appends host LSP diagnostics after local write, edit, and patch", async () => {
+    const dir = tempDir()
+    const received: string[] = []
+    const { context: base } = mockContext(dir)
+    const context = {
+      ...base,
+      async diagnostics(file: string) {
+        received.push(file)
+        return "style/noRestrictedImports: packages/rules holds pure rules: no network"
+      },
+    }
+    const plugin = await RexdTargetPlugin(mockPluginInput(dir))
+
+    const write = await (plugin.tool!.write as any).execute({ filePath: "file.ts", content: "export {}" }, context)
+    expect(write).toBe(
+      "Wrote file.ts\n\nLSP errors detected in this file, please fix:\nstyle/noRestrictedImports: packages/rules holds pure rules: no network",
+    )
+
+    const edit = await (plugin.tool!.edit as any).execute(
+      { filePath: "file.ts", oldString: "export {}", newString: "export const value = 1" },
+      context,
+    )
+    expect(edit.output).toContain("LSP errors detected in this file, please fix:\nstyle/noRestrictedImports")
+
+    const patch = await (plugin.tool!.apply_patch as any).execute(
+      { patchText: "*** Begin Patch\n*** Update File: file.ts\n@@\n-export const value = 1\n+export const value = 2\n*** End Patch" },
+      context,
+    )
+    expect(patch.output).toContain("LSP errors detected in file.ts, please fix:\nstyle/noRestrictedImports")
+    expect(received).toHaveLength(3)
+  })
+})

@@ -1173,6 +1173,19 @@ function relativeUiPathFromCwd(cwd: string, absolutePath: string, fallback: stri
   return fallback
 }
 
+type DiagnosticsContext = ToolContext & {
+  diagnostics?: (file: string) => Promise<string | undefined>
+}
+
+export async function appendLocalDiagnostics(
+  context: ToolContext,
+  file: string,
+  output: string,
+  subject: string = "this file",
+): Promise<string> {
+  const report = await (context as DiagnosticsContext).diagnostics?.(file)
+  return report ? output + "\n\nLSP errors detected in " + subject + ", please fix:\n" + report : output
+}
 function sequenceMatches(
   lines: string[],
   pattern: string[],
@@ -2606,7 +2619,7 @@ export const RexdTargetPlugin: Plugin = async (input) => {
               const dir = dirname(path)
               if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
               writeFileSync(path, args.content)
-              return `Wrote ${args.filePath}`
+              return await appendLocalDiagnostics(context, path, `Wrote ${args.filePath}`)
             },
             remote: async () => {
               const { alias, target } = configuredActiveTarget(state)
@@ -2664,7 +2677,11 @@ export const RexdTargetPlugin: Plugin = async (input) => {
               writeFileSync(path, edited.content)
               return {
                 title: relativeUiPathFromWorktree(context.worktree, path, args.filePath),
-                output: `Edited ${args.filePath} (${edited.replacements} replacement${edited.replacements === 1 ? "" : "s"})`,
+                output: await appendLocalDiagnostics(
+                  context,
+                  path,
+                  `Edited ${args.filePath} (${edited.replacements} replacement${edited.replacements === 1 ? "" : "s"})`,
+                ),
                 metadata: buildEditUiMetadata(path, current, edited.content),
               }
             },
@@ -2737,8 +2754,23 @@ export const RexdTargetPlugin: Plugin = async (input) => {
                 files = buildLocalPatchUiFiles(context.directory, args.patchText, context.worktree)
               } catch {}
               const summary = applyLocalPatch(context.directory, args.patchText)
+              let output = renderPatchSummary(summary)
+              const seen = new Set<string>()
+              for (const hunk of hunks) {
+                if (hunk.type === "delete") continue
+                const outputPath = hunk.type === "update" ? (hunk.movePath ?? hunk.path) : hunk.path
+                const target = localPath(context.directory, outputPath)
+                if (seen.has(target)) continue
+                seen.add(target)
+                output = await appendLocalDiagnostics(
+                  context,
+                  target,
+                  output,
+                  relativeUiPathFromWorktree(context.worktree, target, outputPath),
+                )
+              }
               return {
-                output: renderPatchSummary(summary),
+                output,
                 metadata: files ? { files, diff: files.map((file) => file.patch).join("\n") } : undefined,
               }
             },
