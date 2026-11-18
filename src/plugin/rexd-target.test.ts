@@ -969,3 +969,36 @@ describe("local edit diagnostics", () => {
     expect(received).toHaveLength(3)
   })
 })
+
+describe("local edit diagnostic failures", () => {
+  test("keeps successful local mutations successful when diagnostics reject", async () => {
+    const dir = tempDir()
+    const attempted: string[] = []
+    const { context: base } = mockContext(dir)
+    const context = {
+      ...base,
+      async diagnostics(file: string) {
+        attempted.push(file)
+        throw new Error("simulated LSP timeout")
+      },
+    }
+    const plugin = await RexdTargetPlugin(mockPluginInput(dir))
+
+    const write = await (plugin.tool!.write as any).execute({ filePath: "file.ts", content: "export {}" }, context)
+    expect(write).toBe("Wrote file.ts")
+
+    const edit = await (plugin.tool!.edit as any).execute(
+      { filePath: "file.ts", oldString: "export {}", newString: "export const value = 1" },
+      context,
+    )
+    expect(edit.output).toBe("Edited file.ts (1 replacement)")
+
+    const patch = await (plugin.tool!.apply_patch as any).execute(
+      { patchText: "*** Begin Patch\n*** Update File: file.ts\n@@\n-export const value = 1\n+export const value = 2\n*** End Patch" },
+      context,
+    )
+    expect(patch.output).toContain("Patch applied:")
+    expect(patch.output).not.toContain("LSP errors detected")
+    expect(attempted).toHaveLength(3)
+  })
+})

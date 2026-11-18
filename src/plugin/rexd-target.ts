@@ -1183,8 +1183,12 @@ export async function appendLocalDiagnostics(
   output: string,
   subject: string = "this file",
 ): Promise<string> {
-  const report = await (context as DiagnosticsContext).diagnostics?.(file)
-  return report ? output + "\n\nLSP errors detected in " + subject + ", please fix:\n" + report : output
+  try {
+    const report = await (context as DiagnosticsContext).diagnostics?.(file)
+    return report ? output + "\n\nLSP errors detected in " + subject + ", please fix:\n" + report : output
+  } catch {
+    return output
+  }
 }
 function sequenceMatches(
   lines: string[],
