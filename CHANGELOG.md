@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Local `write`, `edit` and `apply_patch` now append the host's LSP errors for each changed file, in the same format as OpenCode's built-in edit tools. This needs an OpenCode build that offers the optional `diagnostics` tool-context hook; on other builds, and for remote targets, the output is unchanged.
+- If the diagnostics check fails, the edit still reports success, without an error block.
+
 ## v0.3.16 - 2026-11-09
 
 - Emit the `project:` permission namespace only for local rm operands that were resolved to a path strictly inside the session's Git root. Unresolved operands (for example after `cd "$X"`), options, and whole-line fallbacks now write any `project:` text as `project%3A`, so they can no longer match project allow rules; recursive deletes of such operands ask like any other unresolved operand.
